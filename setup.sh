@@ -1,57 +1,68 @@
 #!/bin/bash
-
 set -e
 
-echo "🔧 Updating system..."
+PROJECT_DIR="/home/pi/meshtastic-badge"
+
+echo "🔧 1. Updating system..."
 apt update && apt full-upgrade -y
 
-echo "🔧 Enabling SPI, I2C, and Bluetooth..."
+echo "🔧 2. Enable SPI, I2C (touch), and Bluetooth..."
 raspi-config nonint do_spi 0
 raspi-config nonint do_i2c 0
 rfkill unblock bluetooth
 systemctl enable bluetooth
 systemctl start bluetooth
 
-echo "🔧 Installing core dependencies..."
+echo "🔧 3. Add user 'pi' to bluetooth and dialout groups..."
+usermod -aG bluetooth,dialout pi
+
+echo "📦 4. Install system dependencies..."
 apt install -y \
-  python3 python3-pip python3-venv \
+  python3 python3-venv python3-pip \
   git libffi-dev libbluetooth-dev \
-  python3-pygame python3-pil \
-  bluez bluez-tools \
-  iw tcpdump net-tools \
-  fonts-dejavu unzip
+  python3-pygame python3-pil python3-evdev \
+  bluez bluez-tools dbus-user-session \
+  iw tcpdump libcap2-bin net-tools \
+  fonts-dejavu unzip curl
 
-echo "🔧 Installing Meshtastic with BLE support..."
-pip3 install meshtastic[ble] bleak
+echo "📁 5. Create project directory at $PROJECT_DIR..."
+mkdir -p "$PROJECT_DIR"/{logs,cache,assets}
+cd "$PROJECT_DIR"
 
-echo "🔧 Installing scanning tools and BLE libraries..."
-pip3 install pybluez scapy
+echo "🐍 6. Set up Python virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
 
-echo "📦 Creating project directories..."
-mkdir -p ~/meshtastic-badge/{logs,cache,assets}
-cd ~/meshtastic-badge
+echo "⬆️ 7. Upgrade pip & install Python packages..."
+pip install --upgrade pip
+pip install meshtastic[ble] bleak pybluez scapy
 
-echo "📦 Downloading retro pixel font..."
-curl -L -o assets/pixel_font.ttf https://github.com/adamyg/fonts/raw/master/bitwise/bitwise.ttf
+echo "🎨 8. Download retro pixel font..."
+curl -L -o assets/pixel_font.ttf \
+  https://github.com/adamyg/fonts/raw/master/bitwise/bitwise.ttf
 
-echo "🛠️ Setting up systemd autostart..."
-cat <<EOF | sudo tee /etc/systemd/system/meshtastic-badge.service
+echo "🛠️ 9. Install meshtastic-badge service..."
+cat <<EOF | tee /etc/systemd/system/meshtastic-badge.service
 [Unit]
 Description=Meshtastic Badge Display
 After=bluetooth.target network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/meshtastic-badge/main.py
-WorkingDirectory=/home/pi/meshtastic-badge
-StandardOutput=inherit
-StandardError=inherit
+ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/main.py
+WorkingDirectory=$PROJECT_DIR
 Restart=always
+StandardOutput=journal
+StandardError=journal
 User=pi
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl enable meshtastic-badge
+systemctl daemon-reload
+systemctl enable meshtastic-badge
 
-echo "✅ Setup complete. You can now place your main.py code in ~/meshtastic-badge and reboot."
+echo "✅ Setup complete!"
+echo "   • Place your main.py in $PROJECT_DIR"
+echo "   • Touchscreen drivers must already be installed"
+echo "   • Reboot to start the badge UI: sudo reboot"
