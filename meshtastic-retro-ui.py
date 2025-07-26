@@ -2,9 +2,8 @@
 import curses
 import json
 import sqlite3
-from meshtastic.ble_interface import BLEInterface
-from pubsub import pub
 import threading
+from meshtastic.serial_interface import SerialInterface as BLEInterface
 
 # --- CONFIG ---
 LOG_JSON = True                   # append raw JSON to log file
@@ -31,7 +30,10 @@ if LOG_SQLITE:
 
 # --- MESHTASTIC CALLBACK ---
 messages = []
-def on_receive(packet, interface):
+def on_receive(packet=None, interface=None, **kwargs):
+    # Ignore progress pings or other non‑dict events
+    if not isinstance(packet, dict):
+        return
     js = packet.get("decoded", {})
     text = js.get("text")
     src  = packet.get("from", {}).get("userAlias", "unknown")
@@ -58,9 +60,9 @@ def run_ui(stdscr):
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
-    iface = BLEInterface(address=NODE_ADDR)
-    pub.subscribe(on_receive, "meshtastic.receive")
-    threading.Thread(target=iface.loop_forever, daemon=True).start()
+    iface = BLEInterface(devPath=DEV_PATH) 
+    iface.onReceive = on_receive
+    threading.Thread(target=iface.start, daemon=True).start()
 
     offset = 0
     while True:
