@@ -56,7 +56,7 @@ def run_ui(stdscr):
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
     iface = mserial.SerialInterface(devPath=DEV_PATH)
-    iface.onReceive(on_receive)
+    iface.onReceive= on_receive
 
     offset = 0
     while True:
