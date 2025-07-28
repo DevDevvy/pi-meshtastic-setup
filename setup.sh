@@ -1,7 +1,11 @@
 #!/bin/bash
 set -e
-
-PROJECT_DIR="/home/pi/meshtastic-badge"
+USER="change_me"
+PROJECT_DIR="/home/$USER/meshtastic-badge"
+# sanity‑check
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root (sudo)"; exit 1
+fi
 
 echo "🔧 1. Updating system..."
 apt update && apt full-upgrade -y
@@ -13,8 +17,8 @@ rfkill unblock bluetooth
 systemctl enable bluetooth
 systemctl start bluetooth
 
-echo "🔧 3. Add user 'pi' to bluetooth and dialout groups..."
-usermod -aG bluetooth,dialout pi
+echo "🔧 3. Add user $USER to bluetooth and dialout groups..."
+usermod -aG bluetooth,dialout $USER
 
 echo "📦 4. Install system dependencies..."
 apt install -y \
@@ -48,12 +52,12 @@ Description=Meshtastic Badge Display
 After=bluetooth.target network.target
 
 [Service]
-ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/main.py
+ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/meshtastic-retro-ui.py
 WorkingDirectory=$PROJECT_DIR
 Restart=always
 StandardOutput=journal
 StandardError=journal
-User=pi
+User=$USER
 
 [Install]
 WantedBy=multi-user.target
