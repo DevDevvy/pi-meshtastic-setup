@@ -174,8 +174,10 @@ def ui(stdscr) -> None:
 
         # header bar
         header_str = HEADER + ("[● LINK]" if link_up_evt.is_set() else "[○ NO LINK]")
-        stdscr.addstr(0, 0, header_str.ljust(w)[:w], color)
-
+        try:
+            stdscr.addstr(0, 0, header_str.ljust(w)[:w], color)
+        except curses.error:
+            pass
         # message area
         for idx in range(pad_height):
             row = idx + SCREEN_PAD
@@ -184,16 +186,23 @@ def ui(stdscr) -> None:
                 break
             ts, src, text = msgs[msg_idx]
             line = f"{fmt_ts(ts)} {src[:10]:>10} │ {text}"
-            stdscr.addstr(row, 0, line.ljust(w)[:w], color)
-
+            try:
+                stdscr.addstr(row, 0, line.ljust(w)[:w], color)
+            except curses.error:
+                pass
         # footer / prompt
         if send_mode:
             prompt = "Send> " + input_buf
-            stdscr.addstr(h - 1, 0, prompt.ljust(w)[:w], color)
-            stdscr.move(h - 1, min(w - 1, len(prompt)))
+            try:
+                stdscr.addstr(h - 1, 0, prompt.ljust(w)[:w], color)
+                stdscr.move(h - 1, min(w - 1, len(prompt)))
+            except curses.error:
+                pass
         else:
-            stdscr.addstr(h - 1, 0, FOOTER.ljust(w)[:w], color)
-
+            try:
+                stdscr.addstr(h - 1, 0, FOOTER.ljust(w)[:w], color)
+            except curses.error:
+                pass
         stdscr.refresh()
         curses.napms(25)
 
