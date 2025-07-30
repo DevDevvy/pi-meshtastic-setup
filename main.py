@@ -1,6 +1,4 @@
 import os
-os.environ["SDL_VIDEODRIVER"] = "fbcon"
-os.environ["SDL_FBDEV"]      = "/dev/fb0" 
 import threading
 import asyncio
 import subprocess
@@ -10,8 +8,9 @@ from datetime import datetime
 import pygame
 from pygame.locals import *
 
-from meshtastic.serial_interface import SerialInterface
-
+import meshtastic
+from meshtastic.ble_interface import BLEInterface
+from bleak import BleakScanner
 
 # Configuration
 PROJECT_DIR = "/home/pi/meshtastic-badge"
@@ -58,13 +57,32 @@ def on_receive(packet):
 
 # Thread: Meshtastic BLE listener with auto-discovery
 
-def serial_listener():
-    iface = SerialInterface(devPath='/dev/rfcomm0')
-    iface.onReceive = on_receive
-    iface.start()       # spins up the read thread
+def ble_listener():
+    device_mac = None
+    while not device_mac:
+        print("🔍 Scanning for Meshtastic BLE devices...")
+        devices = asyncio.run(BleakScanner.discover(timeout=5.0))
+        for d in devices:
+            if d.name and d.name.lower().startswith("meshtastic"):
+                device_mac = d.address
+                print(f"🔗 Found Meshtastic device: {d.name} at {device_mac}")
+                break
+        if not device_mac:
+            time.sleep(5)
+    interface = BLEInterface(device_mac)
+    interface.onReceive = on_receive
+    interface.loop_forever()
 
-# Start the serial listener instead of ble_listener
-threading.Thread(target=serial_listener, daemon=True).start()
+# Thread: BLE device scanner
+
+def ble_scan_loop():
+    while True:
+        devices = asyncio.run(BleakScanner.discover(timeout=5.0))
+        with lock:
+            ble_devices.clear()
+            for d in devices:
+                ble_devices.add(d.address)
+        time.sleep(10)
 
 # Thread: Wi-Fi SSID scanner
 
@@ -85,6 +103,8 @@ def wifi_scan_loop():
         time.sleep(15)
 
 # Start background threads
+threading.Thread(target=ble_listener, daemon=True).start()
+threading.Thread(target=ble_scan_loop, daemon=True).start()
 threading.Thread(target=wifi_scan_loop, daemon=True).start()
 
 # Initialize Pygame
@@ -132,10 +152,8 @@ while running:
         try:
             info_surf = font.render(info, True, FG_COLOR)
             screen.blit(info_surf, (0, SCREEN_HEIGHT - 20))
-        except Exception as e:
-            print("⚠️ Render error:", e)
-            import traceback; traceback.print_exc()
-
+        except Exception:
+            pass
 
     pygame.display.flip()
     clock.tick(10)
