@@ -125,8 +125,13 @@ def serial_listener():
         connection_status = f"Connecting to {DEV_PATH}"
         with lock:
             messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
-
-        iface = SerialInterface(devPath=DEV_PATH)
+        try:
+            iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
+        except Exception as e:
+            connection_status = f"Open error: {e}"
+            with lock:
+                messages.append(("SYSTEM", f"Open error: {e}"))
+            return
         iface.onReceive       = on_receive
         iface.onConnection    = on_connection
         iface.onLostConnection= on_lost_connection
