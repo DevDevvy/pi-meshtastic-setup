@@ -12,6 +12,7 @@ import os
 import stat
 from pathlib import Path
 from meshtastic.serial_interface import SerialInterface
+from pubsub import pub   # pip install pypubsub
 
 # --- CONFIG ---
 LOG_JSON   = True
@@ -84,11 +85,13 @@ def on_receive(packet, topic=None):
             messages.append(("ERROR", f"Packet processing error: {e}"))
 
 def on_connection(topic=None):
+    """Callback for connection established"""
     global connection_status
     connection_status = "Connected"
     interface_ready.set()
 
 def on_lost_connection(topic=None):
+    """Callback for connection lost"""
     global connection_status
     connection_status = "Disconnected"
     interface_ready.clear()
@@ -121,64 +124,59 @@ def serial_listener():
         return
 
     # 2) Try opening
+    connection_status = f"Connecting to {DEV_PATH}"
+    with lock:
+        messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
+
     try:
-        connection_status = f"Connecting to {DEV_PATH}"
-        with lock:
-            messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
-        try:
-            iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
-        except Exception as e:
-            connection_status = f"Open error: {e}"
-            with lock:
-                messages.append(("SYSTEM", f"Open error: {e}"))
-            return
-        iface.onReceive       = on_receive
-        iface.onConnection    = on_connection
-        iface.onLostConnection= on_lost_connection
-
-        # 3) Wait up to 10s for link-up
-        for i in range(20):
-            time.sleep(0.5)
-            connection_status = f"Waiting... ({i+1}/20)"
-            if getattr(iface, "isConnected", False) or getattr(iface.stream, "is_open", False):
-                break
-
-        if not (iface.isConnected or iface.stream.is_open):
-            connection_status = "Connection failed"
-            with lock:
-                messages.extend([
-                    ("SYSTEM", "Unable to connect after timeout"),
-                ])
-            return
-
-        # 4) Success
-        connection_status = "Connected"
-        interface_ready.set()
-        with lock:
-            messages.append(("SYSTEM", "Successfully connected"))
-
-        # 5) Node info (optional)
-        try:
-            info = iface.getMyNodeInfo()
-            with lock:
-                messages.append(("SYSTEM", f"Node info: {str(info)[:60]}…"))
-        except:
-            pass
-
-        # 6) Keep‐alive loop
-        while True:
-            time.sleep(1)
-            if not (iface.isConnected or iface.stream.is_open):
-                connection_status = "Disconnected"
-                interface_ready.clear()
-                with lock:
-                    messages.append(("SYSTEM", "Lost connection"))
-                break
-
+        iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
     except Exception as e:
-        connection_status = f"Fatal Error: {e}"
+        connection_status = f"Open error: {e}"
         with lock:
-            messages.append(("SYSTEM", f"Fatal connection error: {e}"))
+            messages.append(("SYSTEM", f"Open error: {e}"))
+        return
+
+    # 3) Subscribe to PubSub topics
+    pub.subscribe(on_receive,            "meshtastic.receive")
+    pub.subscribe(on_connection,         "meshtastic.connection.established")
+    pub.subscribe(on_lost_connection,    "meshtastic.connection.lost")
+
+    # 4) Wait up to 10s for link-up
+    for i in range(20):
+        time.sleep(0.5)
+        connection_status = f"Waiting… ({i+1}/20)"
+        if getattr(iface, "isConnected", False) or getattr(iface.stream, "is_open", False):
+            break
+
+    if not (iface.isConnected or iface.stream.is_open):
+        connection_status = "Connection failed"
+        with lock:
+            messages.append(("SYSTEM", "Unable to connect after timeout"))
+        return
+
+    # 5) Success
+    connection_status = "Connected"
+    interface_ready.set()
+    with lock:
+        messages.append(("SYSTEM", "Successfully connected"))
+
+    # 6) Optional: show node info
+    try:
+        info = iface.getMyNodeInfo()
+        with lock:
+            messages.append(("SYSTEM", f"Node info: {str(info)[:60]}…"))
+    except:
+        pass
+
+    # 7) Keep-alive loop
+    while True:
+        time.sleep(1)
+        if not (iface.isConnected or iface.stream.is_open):
+            connection_status = "Disconnected"
+            interface_ready.clear()
+            with lock:
+                messages.append(("SYSTEM", "Lost connection"))
+            break
 
 def send_message(text):
     """Send text if interface is ready"""
@@ -192,8 +190,8 @@ def send_message(text):
     except Exception as e:
         return False, f"Send error: {e}"
 
-# --- UI LOOP ---
 def run_ui(stdscr):
+    """Main UI loop"""
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
@@ -202,10 +200,10 @@ def run_ui(stdscr):
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
-    # start serial in background
+    # start serial listener in background
     threading.Thread(target=serial_listener, daemon=True).start()
 
-    offset = 0
+    offset       = 0
     status_msg   = ""
     status_color = 1
 
@@ -213,19 +211,19 @@ def run_ui(stdscr):
         h, w = stdscr.getmaxyx()
         stdscr.erase()
 
-        # ┌── HEADER ──┐
+        # Header
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(0, 0, "╔" + "═"*(w-2) + "╗")
         header = f"║ RetroMeshtastic — {connection_status}"
         stdscr.addstr(1, 0, header.ljust(w-1) + "║")
         stdscr.attroff(curses.color_pair(1))
 
-        # ■ Messages window
+        # Messages
         with lock:
-            total    = len(messages)
-            max_off  = max(0, total - (h-5))
-            offset   = min(offset, max_off)
-            view     = messages[offset:offset+(h-5)]
+            total   = len(messages)
+            max_off = max(0, total - (h-5))
+            offset  = min(offset, max_off)
+            view    = messages[offset:offset+(h-5)]
 
         for i, (src, txt) in enumerate(view):
             clr = curses.color_pair(3) if src == "You" else curses.color_pair(1)
@@ -238,7 +236,7 @@ def run_ui(stdscr):
         if status_msg:
             stdscr.addstr(h-3, 1, status_msg[:w-2], curses.color_pair(status_color))
 
-        # ╰── FOOTER ──╯
+        # Footer
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝")
         stdscr.addstr(h-1, 0, "Press 's' to send | ↑/↓ scroll | Ctrl-C exit".ljust(w-1))
@@ -262,7 +260,6 @@ def run_ui(stdscr):
                 status_msg, status_color = "Interface not ready", 2
                 continue
 
-            # blocking input
             stdscr.timeout(-1)
             curses.echo(); curses.curs_set(1)
             stdscr.addstr(h-1, 0, "Send: ".ljust(w-1))
@@ -285,7 +282,7 @@ def run_ui(stdscr):
             break
 
 def cleanup():
-    """Tidy up on exit"""
+    """Clean up resources"""
     global iface, json_fh, conn
     if iface:
         try: iface.close()
