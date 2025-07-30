@@ -122,7 +122,7 @@ def serial_listener():
     pub.subscribe(on_lost_connection,   "meshtastic.connection.lost")
 
     try:
-        iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
+        iface = SerialInterface(devPath=DEV_PATH)
     except Exception as e:
         connection_status = f"Open error: {e}"
         with lock:
