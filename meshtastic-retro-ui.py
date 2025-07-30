@@ -10,8 +10,8 @@ from meshtastic.serial_interface import SerialInterface
 # --- CONFIG ---
 LOG_JSON = True                   # append raw JSON to log file
 LOG_SQLITE = True                 # insert messages into SQLite
-LOG_FILE = "/home/pi/meshtastic.log"
-DB_FILE  = "/home/pi/meshtastic.db"
+LOG_FILE = "/home/rangerdan/meshtastic.log"
+DB_FILE  = "/home/rangerdan/meshtastic.db"
 DEV_PATH = "/dev/rfcomm0"
 NODE_ADDR = "00:11:22:33:44:55"  # replace with your node's BLE address
 
@@ -126,83 +126,74 @@ def serial_listener():
     """Initialize and manage the Meshtastic interface"""
     global iface, connection_status
     
-    # First check if device exists
+    # 1) Device check
     exists, msg = check_device_exists()
     if not exists:
         connection_status = f"Device Error: {msg}"
         with lock:
-            messages.append(("SYSTEM", f"Device check failed: {msg}"))
-            messages.append(("SYSTEM", "Make sure Bluetooth pairing script ran successfully"))
-            messages.append(("SYSTEM", f"Expected device: {DEV_PATH}"))
+            messages.extend([
+                ("SYSTEM", f"Device check failed: {msg}"),
+                ("SYSTEM", "Make sure you ran 'sudo rfcomm bind' or paired via bluetoothctl"),
+                ("SYSTEM", f"Expected device: {DEV_PATH}")
+            ])
         return
     
+    # 2) Try to open
     try:
-        connection_status = "Connecting to " + DEV_PATH
+        connection_status = f"Connecting to {DEV_PATH}"
         with lock:
             messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
         
-        # Try to connect with timeout
-        import signal
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Connection timeout")
-        
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(15)  # 15 second timeout
-        
-        try:
-            iface = SerialInterface(devPath=DEV_PATH)
-            signal.alarm(0)  # Cancel timeout
-        except TimeoutError:
-            connection_status = "Connection timeout - check device"
-            with lock:
-                messages.append(("SYSTEM", "Connection timed out after 15 seconds"))
-                messages.append(("SYSTEM", "Try re-running the Bluetooth pairing script"))
-            return
-        
-        # Set up callbacks
+        iface = SerialInterface(devPath=DEV_PATH)
         iface.onReceive = on_receive
-        if hasattr(iface, 'onConnection'):
-            iface.onConnection = on_connection
-        if hasattr(iface, 'onLostConnection'):
-            iface.onLostConnection = on_lost_connection
+        iface.onConnection = on_connection
+        iface.onLostConnection = on_lost_connection
         
-        # Wait for connection with progress updates
-        for i in range(10):
+        # 3) Wait for link-up
+        for i in range(20):
             time.sleep(0.5)
-            if hasattr(iface, 'isConnected') and iface.isConnected:
+            connection_status = f"Waiting for connection... ({i+1}/20)"
+            if getattr(iface, "isConnected", False) or getattr(iface.stream, "is_open", False):
                 break
-            connection_status = f"Connecting... ({i+1}/10)"
         
-        # Check final connection status
-        if hasattr(iface, 'isConnected') and iface.isConnected:
-            connection_status = "Connected"
-            interface_ready.set()
-            with lock:
-                messages.append(("SYSTEM", "Successfully connected to Meshtastic device"))
-        else:
+        if iface is None or not (iface.isConnected or iface.stream.is_open):
             connection_status = "Connection failed"
             with lock:
-                messages.append(("SYSTEM", "Failed to establish connection"))
-                messages.append(("SYSTEM", "Check if device is paired and RFCOMM is bound"))
-            
-        # Keep the interface alive
+                messages.extend([
+                    ("SYSTEM", "Unable to connect after timeout"),
+                    ("SYSTEM", "Run `python3 test_connection.py` for diagnostics"),
+                ])
+            return
+        
+        # 4) Success!
+        connection_status = "Connected"
+        interface_ready.set()
+        with lock:
+            messages.append(("SYSTEM", "Successfully connected"))
+        
+        # 5) Optional: show node info
+        try:
+            info = iface.getMyNodeInfo()
+            with lock:
+                messages.append(("SYSTEM", f"Node info: {str(info)[:60]}…"))
+        except Exception:
+            pass
+        
+        # 6) Keep alive
         while True:
             time.sleep(1)
-            if hasattr(iface, 'isConnected') and not iface.isConnected:
+            if not (iface.isConnected or iface.stream.is_open):
                 connection_status = "Disconnected"
                 interface_ready.clear()
                 with lock:
-                    messages.append(("SYSTEM", "Lost connection to device"))
-                
+                    messages.append(("SYSTEM", "Lost connection"))
+                break
+
     except Exception as e:
-        connection_status = f"Error: {str(e)}"
+        connection_status = f"Fatal Error: {e}"
         with lock:
-            messages.append(("SYSTEM", f"Connection error: {str(e)}"))
-            messages.append(("SYSTEM", "Common fixes:"))
-            messages.append(("SYSTEM", "1. Run the pairing script first"))
-            messages.append(("SYSTEM", "2. Check if device is in range"))
-            messages.append(("SYSTEM", "3. Verify RFCOMM binding with 'rfcomm show'"))
+            messages.append(("SYSTEM", f"Fatal connection error: {e}"))
+            messages.append(("SYSTEM", "Run test_connection.py for diagnostics"))
 
 def send_message(text):
     """Send a text message via Meshtastic"""
