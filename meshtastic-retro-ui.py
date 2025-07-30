@@ -128,13 +128,13 @@ def serial_listener():
             messages.append(("SYSTEM", connection_status))
         return
 
-    # Block until connected or timeout
-    if not iface.waitForConnection(timeoutSecs=15):
+    # Wait up to 15 seconds for the connection to become ready
+    if not iface.isConnected.wait(15):
         connection_status = "Connection timeout"
         with lock:
             messages.append(("SYSTEM", "Unable to connect"))
         return
-    # waitForConnection sets isConnected but we rely on on_connection to set event; fallback:
+    # isConnected event might fire before our subscriber is ready
     if not interface_ready.is_set():
         on_connection(iface)
 
