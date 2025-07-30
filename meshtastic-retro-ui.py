@@ -106,39 +106,103 @@ def on_lost_connection(interface, topic=None):
     connection_status = "Disconnected"
     interface_ready.clear()
 
+def check_device_exists():
+    """Check if the device file exists and is accessible"""
+    import os
+    import stat
+    
+    if not os.path.exists(DEV_PATH):
+        return False, f"Device {DEV_PATH} does not exist"
+    
+    try:
+        st = os.stat(DEV_PATH)
+        if not stat.S_ISCHR(st.st_mode):
+            return False, f"Device {DEV_PATH} is not a character device"
+        return True, "Device exists and is accessible"
+    except Exception as e:
+        return False, f"Cannot access {DEV_PATH}: {str(e)}"
+
 def serial_listener():
     """Initialize and manage the Meshtastic interface"""
     global iface, connection_status
     
+    # First check if device exists
+    exists, msg = check_device_exists()
+    if not exists:
+        connection_status = f"Device Error: {msg}"
+        with lock:
+            messages.append(("SYSTEM", f"Device check failed: {msg}"))
+            messages.append(("SYSTEM", "Make sure Bluetooth pairing script ran successfully"))
+            messages.append(("SYSTEM", f"Expected device: {DEV_PATH}"))
+        return
+    
     try:
         connection_status = "Connecting to " + DEV_PATH
-        iface = SerialInterface(devPath=DEV_PATH)
+        with lock:
+            messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
+        
+        # Try to connect with timeout
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Connection timeout")
+        
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(15)  # 15 second timeout
+        
+        try:
+            iface = SerialInterface(devPath=DEV_PATH)
+            signal.alarm(0)  # Cancel timeout
+        except TimeoutError:
+            connection_status = "Connection timeout - check device"
+            with lock:
+                messages.append(("SYSTEM", "Connection timed out after 15 seconds"))
+                messages.append(("SYSTEM", "Try re-running the Bluetooth pairing script"))
+            return
         
         # Set up callbacks
         iface.onReceive = on_receive
-        iface.onConnection = on_connection
-        iface.onLostConnection = on_lost_connection
+        if hasattr(iface, 'onConnection'):
+            iface.onConnection = on_connection
+        if hasattr(iface, 'onLostConnection'):
+            iface.onLostConnection = on_lost_connection
         
-        # Wait for connection
-        time.sleep(2)  # Give it time to connect
+        # Wait for connection with progress updates
+        for i in range(10):
+            time.sleep(0.5)
+            if hasattr(iface, 'isConnected') and iface.isConnected:
+                break
+            connection_status = f"Connecting... ({i+1}/10)"
         
-        if iface.isConnected:
+        # Check final connection status
+        if hasattr(iface, 'isConnected') and iface.isConnected:
             connection_status = "Connected"
             interface_ready.set()
+            with lock:
+                messages.append(("SYSTEM", "Successfully connected to Meshtastic device"))
         else:
             connection_status = "Connection failed"
+            with lock:
+                messages.append(("SYSTEM", "Failed to establish connection"))
+                messages.append(("SYSTEM", "Check if device is paired and RFCOMM is bound"))
             
         # Keep the interface alive
         while True:
             time.sleep(1)
-            if not iface.isConnected:
+            if hasattr(iface, 'isConnected') and not iface.isConnected:
                 connection_status = "Disconnected"
                 interface_ready.clear()
+                with lock:
+                    messages.append(("SYSTEM", "Lost connection to device"))
                 
     except Exception as e:
         connection_status = f"Error: {str(e)}"
         with lock:
             messages.append(("SYSTEM", f"Connection error: {str(e)}"))
+            messages.append(("SYSTEM", "Common fixes:"))
+            messages.append(("SYSTEM", "1. Run the pairing script first"))
+            messages.append(("SYSTEM", "2. Check if device is in range"))
+            messages.append(("SYSTEM", "3. Verify RFCOMM binding with 'rfcomm show'"))
 
 def send_message(text):
     """Send a text message via Meshtastic"""
