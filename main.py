@@ -1,259 +1,142 @@
-#!/usr/bin/env python3
-"""
-Retro Meshtastic Badge – Robust 3.5″ Touch Console
- • Auto‑retry on /dev/rfcomm0 or auto‑scan fallback
- • PubSub‑driven link status & incoming packets
- • Single shared SerialInterface for send/receive
- • SQLite + JSON persistence
- • Curses UI with exact width & touch/scroll
-"""
-
-import os, json, sqlite3, queue, signal, threading, time
-import curses
-from pathlib import Path
+import os
+os.environ["SDL_VIDEODRIVER"] = "fbcon"
+os.environ["SDL_FBDEV"]      = "/dev/fb0" 
+import threading
+import subprocess
+import json
+import time
 from datetime import datetime
+import pygame
+from pygame.locals import *
 
-import meshtastic.serial_interface              # pip install meshtastic
-from pubsub import pub                          # pip install PyPubSub
+from meshtastic.serial_interface import SerialInterface
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
-DEV_PATH   = "/dev/rfcomm0"
-DATA_DIR   = Path.home() / ".retrobadge"
-DATA_DIR.mkdir(exist_ok=True)
 
-LOG_FILE   = DATA_DIR / "meshtastic.log"
-DB_FILE    = DATA_DIR / "meshtastic.db"
+# Configuration
+PROJECT_DIR = "/home/pi/meshtastic-badge"
+CACHE_FILE = os.path.join(PROJECT_DIR, 'cache', 'messages.jsonl')
+FONT_PATH = os.path.join(PROJECT_DIR, 'assets', 'pixel_font.ttf')
+SCREEN_WIDTH, SCREEN_HEIGHT = 320, 240  # adjust if needed
+BG_COLOR = (0, 0, 0)
+FG_COLOR = (0, 255, 0)
 
-THEME_FG, THEME_BG = curses.COLOR_GREEN, curses.COLOR_BLACK
-MAX_LEN, PAD_V    = 240, 2
+# Globals
+messages = []  # list of (timestamp, text)
+ble_devices = set()
+wifi_ssids = set()
+scroll_offset = 0
+lock = threading.Lock()
 
-# ── PERSISTENCE SETUP ─────────────────────────────────────────────────────────
-json_fh = open(LOG_FILE, "a", encoding="utf‑8", buffering=1)
-db      = sqlite3.connect(DB_FILE, check_same_thread=False)
-with db:
-    db.execute("""
-      CREATE TABLE IF NOT EXISTS messages (
-        ts   REAL,
-        src  TEXT,
-        txt  TEXT
-      )
-    """)
+# Ensure directories exist
+os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
 
-# ── THREAD‑SAFE STATE ──────────────────────────────────────────────────────────
-incoming_q  = queue.Queue(1024)
-link_up_evt = threading.Event()
-stop_evt    = threading.Event()
-
-# ── PUBSUB CALLBACKS ──────────────────────────────────────────────────────────
-def on_text(packet, interface):
-    """Handle incoming text packets."""
-    decoded = getattr(packet, "decoded", {}) or packet.get("decoded", {})
-    text    = decoded.get("text")
-    if not text:
-        return
-    # timestamp normalization
-    ts = getattr(packet, "rxTime", packet.get("timestamp", time.time()))
-    if ts > 1e12:
-        ts /= 1000
-    src = getattr(packet, "fromId", packet.get("from", {}).get("userAlias", "unknown"))
-    txt = text[:MAX_LEN]
-
-    # persist
-    json_fh.write(json.dumps(packet, default=str) + "\n")
-    with db:
-        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, txt))
-
-    incoming_q.put((ts, src, txt))
-
-def on_connected(interface):
-    """Fired when link is up."""
-    link_up_evt.set()
-
-def on_disconnected(interface):
-    """Fired when link is lost."""
-    link_up_evt.clear()
-
-# subscribe to Meshtastic PubSub topics :contentReference[oaicite:2]{index=2}
-pub.subscribe(on_text,          'meshtastic.receive.text')
-pub.subscribe(on_connected,     'meshtastic.connection.established')
-pub.subscribe(on_disconnected,  'meshtastic.connection.lost')
-
-# ── RADIO THREAD ──────────────────────────────────────────────────────────────
-iface_lock = threading.Lock()
-iface      = None
-
-def radio_worker():
-    global iface
-    while not stop_evt.is_set():
-        try:
-            # first try explicit path, else auto‑scan
+# Load cached messages
+if os.path.isfile(CACHE_FILE):
+    with open(CACHE_FILE, 'r') as f:
+        for line in f:
             try:
-                new_iface = meshtastic.serial_interface.SerialInterface(devPath=DEV_PATH)
+                msg = json.loads(line)
+                messages.append((msg['time'], msg['text']))
             except Exception:
-                new_iface = meshtastic.serial_interface.SerialInterface()
-
-            # share for sendText() calls
-            with iface_lock:
-                iface = new_iface
-
-            # hang around until error or shutdown
-            while not stop_evt.wait(0.5):
                 pass
 
-        except Exception as e:
-            json_fh.write(f"# radio error: {e}\n")
-            link_up_evt.clear()
-            time.sleep(2)
+# Meshtastic callback
 
-        finally:
-            with iface_lock:
-                if iface:
-                    try: iface.close()
-                    except: pass
-                    iface = None
+def on_receive(packet):
+    try:
+        text = packet['decoded']['text']
+    except Exception:
+        return
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    with lock:
+        messages.append((timestamp, text))
+    # Cache to disk
+    with open(CACHE_FILE, 'a') as f:
+        json.dump({'time': timestamp, 'text': text}, f)
+        f.write('\n')
 
-# ── UTILITIES ─────────────────────────────────────────────────────────────────
-def load_history(limit=2000):
-    cur = db.cursor()
-    cur.execute("SELECT ts, src, txt FROM messages ORDER BY ts DESC LIMIT ?", (limit,))
-    return list(reversed(cur.fetchall()))
+# Thread: Meshtastic BLE listener with auto-discovery
 
-def fmt_ts(ts):
-    return datetime.fromtimestamp(ts).strftime("%H:%M")
+def serial_listener():
+    iface = SerialInterface(devPath='/dev/rfcomm0')
+    iface.onReceive = on_receive
+    iface.start()       # spins up the read thread
 
-# ── CURSES UI ─────────────────────────────────────────────────────────────────
-def run_ui(stdscr):
-    curses.curs_set(0)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, THEME_FG, THEME_BG)
-    color = curses.color_pair(1)
+# Start the serial listener instead of ble_listener
+threading.Thread(target=serial_listener, daemon=True).start()
 
-    msgs     = load_history()
-    height, width = stdscr.getmaxyx()
-    pad_h    = height - PAD_V*2
-    view_ofs = max(0, len(msgs) - pad_h)
+# Thread: Wi-Fi SSID scanner
 
-    send_mode = False
-    input_buf = ""
-
-    HEADER = "╔═ Retro‑Badge – Meshtastic ═╗"
-    FOOTER = "[S]end  [Q]uit  ↑/↓ PgUp/PgDn Touch scroll"
-
-    while not stop_evt.is_set():
-        # consume incoming
+def wifi_scan_loop():
+    while True:
         try:
-            while True:
-                msgs.append(incoming_q.get_nowait())
-        except queue.Empty:
+            result = subprocess.check_output(['iw', 'dev', 'wlan0', 'scan'], stderr=subprocess.DEVNULL).decode()
+            ssids = set()
+            for line in result.splitlines():
+                line = line.strip()
+                if line.startswith('SSID:'):
+                    ssids.add(line.split('SSID:')[1].strip())
+            with lock:
+                wifi_ssids.clear()
+                wifi_ssids.update(ssids)
+        except Exception:
             pass
+        time.sleep(15)
 
-        height, width = stdscr.getmaxyx()
-        pad_h = height - PAD_V*2
+# Start background threads
+threading.Thread(target=wifi_scan_loop, daemon=True).start()
 
-        # auto‑tail
-        if view_ofs >= max(0, len(msgs) - pad_h):
-            view_ofs = max(0, len(msgs) - pad_h)
+# Initialize Pygame
+pygame.init()
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), FULLSCREEN)
+pygame.mouse.set_visible(False)
 
-        stdscr.erase()
-        status = "[● LINK]" if link_up_evt.is_set() else "[○ NO LINK]"
-        stdscr.addstr(0, 0, f"{HEADER} {status}".ljust(width)[:width], color)
+# Load retro font or fallback
+if os.path.isfile(FONT_PATH):
+    font = pygame.font.Font(FONT_PATH, 16)
+else:
+    font = pygame.font.SysFont(None, 16)
 
-        # draw messages
-        for i in range(pad_h):
-            idx = view_ofs + i
-            if idx >= len(msgs):
-                break
-            ts, src, txt = msgs[idx]
-            pre = f"{fmt_ts(ts)} {src[:10]:>10} │ "
-            avail = width - len(pre)
-            stdscr.addstr(PAD_V + i, 0, (pre + txt[:avail]).ljust(width)[:width], color)
+# Main loop
+y = 0
+running = True
+clock = pygame.time.Clock()
+while running:
+    for event in pygame.event.get():
+        if event.type == QUIT:
+            running = False
+        elif event.type == KEYDOWN and event.key == K_ESCAPE:
+            running = False
+        elif event.type == MOUSEBUTTONDOWN:
+            x, y = event.pos
+            if y < SCREEN_HEIGHT * 0.2:
+                scroll_offset = max(0, scroll_offset - 1)
+            else:
+                scroll_offset += 1
 
-        # footer / input
-        if send_mode:
-            prompt = "Send> " + input_buf
-            stdscr.addstr(height-1, 0, prompt.ljust(width)[:width], color)
-            stdscr.move(height-1, min(len(prompt), width-1))
-        else:
-            stdscr.addstr(height-1, 0, FOOTER.ljust(width)[:width], color)
-
-        stdscr.refresh()
-        curses.napms(30)
-
-        # handle keys
+    screen.fill(BG_COLOR)
+    with lock:
+        # Render recent messages
+        visible = messages[max(0, len(messages) - (SCREEN_HEIGHT // 20) - scroll_offset):len(messages) - scroll_offset]
+        y = 0
+        for ts, msg in visible:
+            try:
+                surf = font.render(f"{ts} {msg}", True, FG_COLOR)
+                screen.blit(surf, (0, y))
+            except Exception:
+                pass
+            y += 20
+        # Render BLE & Wi-Fi info
+        info = f"BLE:{len(ble_devices)} WiFi:{len(wifi_ssids)}"
         try:
-            ch = stdscr.getch()
-        except curses.error:
-            continue
+            info_surf = font.render(info, True, FG_COLOR)
+            screen.blit(info_surf, (0, SCREEN_HEIGHT - 20))
+        except Exception as e:
+            print("⚠️ Render error:", e)
+            import traceback; traceback.print_exc()
 
-        if send_mode:
-            if ch in (10, 13):
-                text = input_buf.strip()
-                send_mode = False
-                input_buf = ""
-                if text and link_up_evt.is_set():
-                    ts = time.time()
-                    with db:
-                        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", text))
-                    msgs.append((ts, "You", text))
-                    # thread‑safe send on the shared interface :contentReference[oaicite:3]{index=3}
-                    with iface_lock:
-                        try:
-                            iface.sendText(text)
-                        except Exception as e:
-                            msgs.append((time.time(), "ERR", f"send failed: {e}"))
-            elif ch in (27,):
-                send_mode = False
-            elif ch in (127, 8):
-                input_buf = input_buf[:-1]
-            elif 32 <= ch <= 126:
-                input_buf += chr(ch)
-            continue
 
-        # navigation
-        if ch == curses.KEY_UP:
-            view_ofs = max(0, view_ofs - 1)
-        elif ch == curses.KEY_DOWN:
-            view_ofs = min(len(msgs)-pad_h, view_ofs + 1)
-        elif ch == curses.KEY_PPAGE:
-            view_ofs = max(0, view_ofs - pad_h)
-        elif ch == curses.KEY_NPAGE:
-            view_ofs = min(len(msgs)-pad_h, view_ofs + pad_h)
-        elif ch == curses.KEY_MOUSE:
-            _, mx, my, _, bstate = curses.getmouse()
-            if bstate & curses.BUTTON4_PRESSED:
-                view_ofs = max(0, view_ofs - 3)
-            if bstate & curses.BUTTON5_PRESSED:
-                view_ofs = min(len(msgs)-pad_h, view_ofs + 3)
-            if bstate & curses.BUTTON1_PRESSED:
-                start = my
-            if bstate & curses.BUTTON1_RELEASED:
-                delta = my - start
-                view_ofs = max(0, min(len(msgs)-pad_h, view_ofs - delta))
-        elif ch in (ord('s'), ord('S')):
-            send_mode = True
-            input_buf = ""
-        elif ch in (ord('q'), ord('Q'), 27):
-            stop_evt.set()
+    pygame.display.flip()
+    clock.tick(10)
 
-# ── ENTRY POINT ──────────────────────────────────────────────────────────────
-def main():
-    signal.signal(signal.SIGINT,  lambda *_: stop_evt.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
-
-    # start radio ↔ mesh I/O
-    rt = threading.Thread(target=radio_worker, daemon=True)
-    rt.start()
-
-    # launch UI
-    curses.wrapper(run_ui)
-
-    # cleanup
-    stop_evt.set()
-    rt.join(1)
-    json_fh.close()
-    db.close()
-
-if __name__ == "__main__":
-    main()
+pygame.quit()

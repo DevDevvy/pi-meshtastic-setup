@@ -2,7 +2,9 @@
 import curses
 import json
 import sqlite3
-import meshtastic.serial_interface as mserial
+from meshtastic.ble_interface import BLEInterface
+from pubsub import pub
+import threading
 
 # --- CONFIG ---
 LOG_JSON = True                   # append raw JSON to log file
@@ -10,6 +12,7 @@ LOG_SQLITE = True                 # insert messages into SQLite
 LOG_FILE = "/home/rangerdan/meshtastic.log"
 DB_FILE  = "/home/rangerdan/meshtastic.db"
 DEV_PATH = "/dev/rfcomm0"
+NODE_ADDR = "00:11:22:33:44:55"  # replace with your node's BLE address
 
 # --- SETUP LOGGING ---
 if LOG_JSON:
@@ -28,15 +31,15 @@ if LOG_SQLITE:
 
 # --- MESHTASTIC CALLBACK ---
 messages = []
-def on_receive(pkt, iface):
-    js = pkt.get("decoded", {})
+def on_receive(packet, interface):
+    js = packet.get("decoded", {})
     text = js.get("text")
-    src  = pkt.get("from", {}).get("userAlias", "unknown")
+    src  = packet.get("from", {}).get("userAlias", "unknown")
     if text:
-        ts = pkt.get("timestamp", 0)/1000
+        ts = packet.get("timestamp", 0)/1000
         messages.append((src, text))
         if LOG_JSON:
-            json_fh.write(json.dumps(pkt) + "\n")
+            json_fh.write(json.dumps(packet) + "\n")
         if LOG_SQLITE:
             conn.execute(
               "INSERT INTO messages VALUES (?, ?, ?)",
@@ -55,8 +58,9 @@ def run_ui(stdscr):
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
-    iface = mserial.SerialInterface(devPath=DEV_PATH)
-    iface.onReceive= on_receive
+    iface = BLEInterface(address=NODE_ADDR)
+    pub.subscribe(on_receive, "meshtastic.receive")
+    threading.Thread(target=iface.loop_forever, daemon=True).start()
 
     offset = 0
     while True:
