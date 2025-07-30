@@ -110,32 +110,41 @@ def serial_listener():
         connection_status = f"Device not found: {DEV_PATH}"
         with lock:
             messages.append(("SYSTEM", connection_status))
+        print(connection_status)  # Debug
         return
 
     connection_status = f"Connecting to {DEV_PATH}"
     with lock:
         messages.append(("SYSTEM", connection_status))
+    print(connection_status)  # Debug
 
+    # Register callbacks BEFORE creating SerialInterface
     pub.subscribe(on_receive, "meshtastic.receive")
     pub.subscribe(on_connection, "meshtastic.connection.established")
     pub.subscribe(on_lost_connection, "meshtastic.connection.lost")
 
     try:
+        print("Creating SerialInterface...")  # Debug
         iface = SerialInterface(devPath=DEV_PATH)
+        print("SerialInterface created.")  # Debug
     except Exception as e:
         connection_status = f"Open error: {e}"
         with lock:
             messages.append(("SYSTEM", connection_status))
+        print(connection_status)  # Debug
         return
 
     # Block until connected or timeout
+    print("Waiting for connection...")  # Debug
     if not iface.waitForConnection(timeoutSecs=15):
         connection_status = "Connection timeout"
         with lock:
             messages.append(("SYSTEM", "Unable to connect"))
+        print("Connection timeout")  # Debug
         return
     # waitForConnection sets isConnected but we rely on on_connection to set event; fallback:
     if not interface_ready.is_set():
+        print("on_connection fallback")  # Debug
         on_connection(iface)
 
     while interface_ready.is_set():
