@@ -7,8 +7,8 @@ import meshtastic.serial_interface as mserial
 # --- CONFIG ---
 LOG_JSON = True                   # append raw JSON to log file
 LOG_SQLITE = True                 # insert messages into SQLite
-LOG_FILE = "/home/pi/meshtastic.log"
-DB_FILE  = "/home/pi/meshtastic.db"
+LOG_FILE = "/home/rangerdan/meshtastic.log"
+DB_FILE  = "/home/rangerdan/meshtastic.db"
 DEV_PATH = "/dev/rfcomm0"
 
 # --- SETUP LOGGING ---
