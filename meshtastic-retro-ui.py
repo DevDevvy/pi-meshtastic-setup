@@ -121,8 +121,10 @@ def run_ui(stdscr):
 
         stdscr.erase()
         link_txt = "[● LINK]" if link_up_evt.is_set() else "[○ NO LINK]"
-        stdscr.addstr(0, 0, f"{HEADER} {link_txt}".ljust(w)[:w], color)
-
+        try:
+            stdscr.addstr(0, 0, f"{HEADER} {link_txt}".ljust(w)[:w], color)
+        except curses.error:
+            pass
         # messages
         for i in range(pad_h):
             idx = view_ofs + i
@@ -131,16 +133,23 @@ def run_ui(stdscr):
             ts, src, txt = msgs[idx]
             prefix = f"{fmt_ts(ts)} {src[:10]:>10} │ "
             avail  = w - len(prefix)
-            stdscr.addstr(PAD_V + i, 0, (prefix + txt[:avail]).ljust(w)[:w], color)
-
+            try:
+                stdscr.addstr(PAD_V + i, 0, (prefix + txt[:avail]).ljust(w)[:w], color)
+            except curses.error:
+                pass
         # input / footer
         if send_mode:
             prompt = "Send> " + buf
-            stdscr.addstr(h - 1, 0, prompt.ljust(w)[:w], color)
-            stdscr.move(h - 1, min(len(prompt), w - 1))
+            try:
+                stdscr.addstr(h - 1, 0, prompt.ljust(w)[:w], color)
+                stdscr.move(h - 1, min(len(prompt), w - 1))
+            except curses.error:
+                pass
         else:
-            stdscr.addstr(h - 1, 0, FOOTER.ljust(w)[:w], color)
-
+            try:
+                stdscr.addstr(h - 1, 0, FOOTER.ljust(w)[:w], color)
+            except curses.error:
+                pass
         stdscr.refresh()
         curses.napms(30)
 
