@@ -11,6 +11,7 @@ import sys
 import os
 import stat
 from pathlib import Path
+
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub   # pip install pypubsub
 
@@ -55,8 +56,6 @@ connection_status = "Connecting…"
 
 # --- CALLBACKS ---
 def on_receive(packet, topic=None):
-    """Callback for received packets"""
-    global messages, json_fh, conn
     try:
         decoded = getattr(packet, "decoded", None)
         if decoded and getattr(decoded, "text", None):
@@ -85,19 +84,16 @@ def on_receive(packet, topic=None):
             messages.append(("ERROR", f"Packet processing error: {e}"))
 
 def on_connection(topic=None):
-    """Callback for connection established"""
     global connection_status
     connection_status = "Connected"
     interface_ready.set()
 
 def on_lost_connection(topic=None):
-    """Callback for connection lost"""
     global connection_status
     connection_status = "Disconnected"
     interface_ready.clear()
 
 def check_device_exists():
-    """Ensure /dev/rfcomm0 is present and correct type"""
     if not os.path.exists(DEV_PATH):
         return False, f"{DEV_PATH} does not exist"
     try:
@@ -109,10 +105,9 @@ def check_device_exists():
         return False, str(e)
 
 def serial_listener():
-    """Initialize Meshtastic interface in background thread"""
     global iface, connection_status
 
-    # 1) Device sanity check
+    # 1) Device check
     ok, msg = check_device_exists()
     if not ok:
         connection_status = f"Device Error: {msg}"
@@ -123,11 +118,17 @@ def serial_listener():
             ])
         return
 
-    # 2) Try opening
+    # 2) Tell UI we’re starting
     connection_status = f"Connecting to {DEV_PATH}"
     with lock:
         messages.append(("SYSTEM", f"Attempting to connect to {DEV_PATH}"))
 
+    # 3) Subscribe *before* you call the constructor
+    pub.subscribe(on_receive,            "meshtastic.receive")
+    pub.subscribe(on_connection,         "meshtastic.connection.established")
+    pub.subscribe(on_lost_connection,    "meshtastic.connection.lost")
+
+    # 4) Now open & hand‑off to the library
     try:
         iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
     except Exception as e:
@@ -136,12 +137,7 @@ def serial_listener():
             messages.append(("SYSTEM", f"Open error: {e}"))
         return
 
-    # 3) Subscribe to PubSub topics
-    pub.subscribe(on_receive,            "meshtastic.receive")
-    pub.subscribe(on_connection,         "meshtastic.connection.established")
-    pub.subscribe(on_lost_connection,    "meshtastic.connection.lost")
-
-    # 4) Wait up to 10s for link-up
+    # 5) Wait for link (or timeout after 10s)
     for i in range(20):
         time.sleep(0.5)
         connection_status = f"Waiting… ({i+1}/20)"
@@ -154,13 +150,13 @@ def serial_listener():
             messages.append(("SYSTEM", "Unable to connect after timeout"))
         return
 
-    # 5) Success
+    # 6) Connected!
     connection_status = "Connected"
     interface_ready.set()
     with lock:
         messages.append(("SYSTEM", "Successfully connected"))
 
-    # 6) Optional: show node info
+    # 7) Optional: get node info
     try:
         info = iface.getMyNodeInfo()
         with lock:
@@ -168,7 +164,7 @@ def serial_listener():
     except:
         pass
 
-    # 7) Keep-alive loop
+    # 8) Keep‑alive
     while True:
         time.sleep(1)
         if not (iface.isConnected or iface.stream.is_open):
@@ -179,7 +175,6 @@ def serial_listener():
             break
 
 def send_message(text):
-    """Send text if interface is ready"""
     if not iface or not interface_ready.is_set():
         return False, "Interface not ready"
     try:
@@ -191,7 +186,6 @@ def send_message(text):
         return False, f"Send error: {e}"
 
 def run_ui(stdscr):
-    """Main UI loop"""
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
@@ -200,7 +194,6 @@ def run_ui(stdscr):
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
-    # start serial listener in background
     threading.Thread(target=serial_listener, daemon=True).start()
 
     offset       = 0
@@ -214,29 +207,25 @@ def run_ui(stdscr):
         # Header
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(0, 0, "╔" + "═"*(w-2) + "╗")
-        header = f"║ RetroMeshtastic — {connection_status}"
-        stdscr.addstr(1, 0, header.ljust(w-1) + "║")
+        stdscr.addstr(1, 0, f"║ RetroMeshtastic — {connection_status}".ljust(w-1) + "║")
         stdscr.attroff(curses.color_pair(1))
 
-        # Messages
+        # Messages pane
         with lock:
             total   = len(messages)
             max_off = max(0, total - (h-5))
             offset  = min(offset, max_off)
             view    = messages[offset:offset+(h-5)]
-
         for i, (src, txt) in enumerate(view):
             clr = curses.color_pair(3) if src == "You" else curses.color_pair(1)
             if src in ("ERROR","SYSTEM"):
                 clr = curses.color_pair(2)
-            line = f"{src[:12]}: {txt}"
-            stdscr.addstr(2+i, 1, line[:w-2], clr)
+            stdscr.addstr(2+i, 1, f"{src[:12]}: {txt}"[:w-2], clr)
 
-        # Status line
+        # Footer & input
         if status_msg:
             stdscr.addstr(h-3, 1, status_msg[:w-2], curses.color_pair(status_color))
 
-        # Footer
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝")
         stdscr.addstr(h-1, 0, "Press 's' to send | ↑/↓ scroll | Ctrl-C exit".ljust(w-1))
@@ -282,7 +271,6 @@ def run_ui(stdscr):
             break
 
 def cleanup():
-    """Clean up resources"""
     global iface, json_fh, conn
     if iface:
         try: iface.close()
