@@ -1,254 +1,275 @@
 #!/usr/bin/env python3
+# ░█▀█░█▀▀░░░█▀█░█▀█░█▀█░█▀█
+# ░█▀█░▀▀█░░░█▀▀░█░█░█░█░█░█   Retro‑Badge   v1.0  (Jul‑2025)
+# ░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀░▀   RPi‑4B | Meshtastic
+
 """
-Retro Meshtastic badge – 3.5‑inch console/touch version
-Author: <you>
-Raspberry Pi OS bookworm / Python 3.11
+Touch‑friendly retro console for Meshtastic.
+ • Shows live & historic traffic
+ • Tap‑scroll or ↑ / ↓ / mouse wheel
+ • Type S to send (opens one‑line prompt)
+ • Persists to SQLite and JSON log
+Tested on Raspberry Pi OS Bookworm / Python 3.11
 """
 
-import curses, json, sqlite3, threading, time, os, queue, signal
+###############################################################################
+# ── IMPORTS ──────────────────────────────────────────────────────────────────
+###############################################################################
+from __future__ import annotations
+import curses, curses.textpad, json, os, queue, signal, sqlite3, threading, time
 from pathlib import Path
 from datetime import datetime
-import meshtastic.serial_interface as mserial          # pip install meshtastic
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-DEV_PATH   = "/dev/rfcomm0"                 # created by your BLE‑pair script
-LOG_FILE   = Path("/home/pi/meshtastic.log")
-DB_FILE    = Path("/home/pi/meshtastic.db")
-COLOR_FG   = curses.COLOR_GREEN
-COLOR_BG   = curses.COLOR_BLACK
-MAX_MSGLEN = 240                            # truncate very long payloads
+import meshtastic.serial_interface as mserial         # pip install meshtastic
 
-# ── PERSISTENCE SET‑UP ────────────────────────────────────────────────────────
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-DB_FILE.parent.mkdir(parents=True,  exist_ok=True)
+###############################################################################
+# ── CONFIGURATION ────────────────────────────────────────────────────────────
+###############################################################################
+# If you pair the radio over BLE as /dev/rfcomm0 keep the default.
+# Otherwise override with env var:  MESHTASTIC_DEV=/dev/ttyUSB0
+DEV_PATH   = os.getenv("MESHTASTIC_DEV", "/dev/rfcomm0")
 
-json_fh = open(LOG_FILE, "a", encoding="utf‑8", buffering=1)     # line‑buffered
+DATA_DIR   = Path.home() / ".retrobadge"
+DATA_DIR.mkdir(exist_ok=True)
+
+LOG_FILE   = DATA_DIR / "meshtastic.log"              # line‑buffered JSON
+DB_FILE    = DATA_DIR / "meshtastic.db"               # messages
+THEME_FG   = curses.COLOR_GREEN
+THEME_BG   = curses.COLOR_BLACK
+MAX_LEN    = 240                                      # truncate payloads
+SCREEN_PAD = 2                                        # blank rows top/bottom
+
+###############################################################################
+# ── PERSISTENCE ──────────────────────────────────────────────────────────────
+###############################################################################
+json_fh = open(LOG_FILE, "a", encoding="utf‑8", buffering=1)
 db      = sqlite3.connect(DB_FILE, check_same_thread=False)
 with db:
     db.execute("""CREATE TABLE IF NOT EXISTS messages (
-                      ts  REAL,          -- unix, seconds
-                      src TEXT,
-                      txt TEXT
+                      ts   REAL,        -- Unix seconds
+                      src  TEXT,
+                      txt  TEXT
                   )""")
 
-# ── SHARED STATE ──────────────────────────────────────────────────────────────
-messages      : list[tuple[str,str]] = []   # (src, text)   – newest last
-msg_q         : queue.Queue       = queue.Queue(maxsize=512)  # from radio→UI
-state_lock    = threading.Lock()
-connection_ok = threading.Event()           # set when SerialInterface is live
-stop_event    = threading.Event()
+###############################################################################
+# ── THREAD‑SAFE STATE ────────────────────────────────────────────────────────
+###############################################################################
+incoming_q  : queue.Queue[tuple[float,str,str]] = queue.Queue(1024)
+outgoing_q  : queue.Queue[str]                  = queue.Queue(256)
+link_up_evt = threading.Event()
+stop_evt    = threading.Event()
 
-# ── RADIO CALLBACK ────────────────────────────────────────────────────────────
-def on_receive(pkt, *_):
-    """
-    Robustly pull text out of any variant of Meshtastic packet,
-    log raw JSON and decoded text, then hand to UI via queue.
-    """
-    try:
-        json_fh.write(json.dumps(pkt, default=str) + "\n")
+###############################################################################
+# ── RADIO I/O THREAD ─────────────────────────────────────────────────────────
+###############################################################################
+def radio_worker() -> None:
+    iface: mserial.SerialInterface | None = None
 
-        # —— extract decoded text ——
-        txt = None
-        #  v2.3+  python‑proto objects
-        if hasattr(pkt, "decoded") and hasattr(pkt.decoded, "text"):
-            txt = pkt.decoded.text
-            src = str(pkt.fromId)
-            ts  = pkt.rxTime
-        #  Dict style (meshtastic.util.streamInterface)
-        elif isinstance(pkt, dict):
-            txt = pkt.get("decoded", {}).get("text")
-            src = pkt.get("from", {}).get("userAlias", str(pkt.get("from")))
-            ts  = pkt.get("timestamp", time.time())
-            if ts > 1e12:                       # ms → s
-                ts /= 1000
-        else:
-            return                              # nothing interesting
-
-        if not txt:
-            return
-        txt = txt[:MAX_MSGLEN]
-
-        # —— log to SQLite ——
-        with db:
-            db.execute("INSERT INTO messages VALUES (?,?,?)",
-                       (ts, src, txt))
-
-        # —— push to UI ——
-        msg_q.put_nowait((src[:10], txt))
-
-    except Exception as e:                      # never raise inside callback
-        json_fh.write(f"# callback error: {e}\n")
-
-# ── RADIO THREAD ──────────────────────────────────────────────────────────────
-def radio_thread():
-    iface = None
-    while not stop_event.is_set():
+    def on_receive(pkt, *_):
+        """Meshtastic callback → parse, persist, enqueue for UI."""
         try:
-            connection_ok.clear()
+            json_fh.write(json.dumps(pkt, default=str) + "\n")
+
+            # -------- liberal packet decoding (covers v2.3+ and legacy) ----
+            text, src, ts = None, None, None
+            if hasattr(pkt, "decoded") and getattr(pkt.decoded, "text", None):
+                text = pkt.decoded.text
+                src  = str(pkt.fromId)
+                ts   = pkt.rxTime
+            elif isinstance(pkt, dict):     # older dict style
+                text = pkt.get("decoded", {}).get("text")
+                src  = pkt.get("from", {}).get("userAlias") or str(pkt.get("from"))
+                ts   = pkt.get("timestamp", time.time())
+                if ts > 1e12:               # ms → s
+                    ts /= 1000
+            if not text:
+                return
+
+            text = text[:MAX_LEN]
+            with db:
+                db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+
+            incoming_q.put_nowait((ts, src, text))
+
+        except Exception as e:              # never let the callback raise
+            json_fh.write(f"# on_receive error: {e}\n")
+
+    # ------------------- main connect/loop/retry cycle -----------------------
+    while not stop_evt.is_set():
+        try:
+            link_up_evt.clear()
             iface = mserial.SerialInterface(devPath=DEV_PATH)
             iface.onReceive = on_receive
-            connection_ok.set()                 # success!
-            while not stop_event.is_set():
-                time.sleep(0.5)                 # stay alive
+            link_up_evt.set()
+
+            # send any queued outbound text
+            while not stop_evt.is_set():
+                try:
+                    message = outgoing_q.get(timeout=0.2)
+                    iface.sendText(message)             # simple fire‑and‑forget
+                    # NB: official example ☞ :contentReference[oaicite:0]{index=0}
+                except queue.Empty:
+                    pass
         except Exception as e:
-            json_fh.write(f"# serial err: {e}\n")
-            time.sleep(2)                       # back‑off
+            json_fh.write(f"# radio error: {e}\n")
+            time.sleep(2)                               # gradual back‑off
         finally:
-            try:                               # cleanup if needed
+            try:
                 if iface:
                     iface.close()
             except Exception:
                 pass
 
-# ── LAUNCH RADIO ──────────────────────────────────────────────────────────────
-rt = threading.Thread(target=radio_thread, daemon=True)
-rt.start()
+###############################################################################
+# ── UI HELPERS ───────────────────────────────────────────────────────────────
+###############################################################################
+def load_history(limit: int = 2000) -> list[tuple[float,str,str]]:
+    """Fetch last *limit* messages newest‑last."""
+    cur = db.cursor()
+    cur.execute("SELECT ts, src, txt FROM messages ORDER BY ts DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    return list(reversed(rows))
 
-# ── CURSES UI ────────────────────────────────────────────────────────────────
-def run_ui(stdscr):
-    # console initialisation ---------------------------------------------------
+def fmt_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%H:%M")
+
+###############################################################################
+# ── CURSES USER‑INTERFACE ────────────────────────────────────────────────────
+###############################################################################
+def ui(stdscr) -> None:
     curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, COLOR_FG, COLOR_BG)
+    curses.init_pair(1, THEME_FG, THEME_BG)
+    color = curses.color_pair(1)
 
-    offset = 0             # first visible message index
-    sending = False        # True while user is typing a message
-    input_buf = ""
+    msgs: list[tuple[float,str,str]] = load_history()   # preload history
+    view_ofs = max(0, len(msgs) - (curses.LINES - SCREEN_PAD * 2))
 
-    HEADER = " Retro Meshtastic – touch drag or ↑/↓ to scroll "
-    FOOTER = " [S]end  [Q]uit "
+    send_mode   = False
+    input_buf   = ""
 
-    while not stop_event.is_set():
-        # fetch any newly‑arrived messages ------------------------------
+    HEADER  = " ╔═ Retro‑Badge – Meshtastic ═╗ "
+    FOOTER  = " [S]end   [Q]uit   [↑/↓] scroll   Touch: drag/wheel "
+
+    # ------------------------------ main UI loop ----------------------------
+    while not stop_evt.is_set():
+        # drain any new incoming packets
         try:
             while True:
-                src, txt = msg_q.get_nowait()
-                messages.append((src, txt))
+                pkt = incoming_q.get_nowait()
+                msgs.append(pkt)
         except queue.Empty:
             pass
 
-        # size & layout --------------------------------------------------
-        h, w = stdscr.getmaxyx()
-        pane_height = h - 4                           # header + footer + border
-        max_offset  = max(0, len(messages) - pane_height)
+        # auto‑follow tail if already at bottom
+        pad_height = curses.LINES - SCREEN_PAD * 2
+        if view_ofs >= max(0, len(msgs) - pad_height):
+            view_ofs = max(0, len(msgs) - pad_height)
 
-        # auto‑scroll if at bottom --------------------------------------
-        if offset == max_offset:
-            offset = max_offset                      # follow new msgs
-
-        # drawing --------------------------------------------------------
+        # -------- rendering -------------------------------------------------
         stdscr.erase()
-        colour = curses.color_pair(1)
+        h, w = stdscr.getmaxyx()
 
-        # header line
-        stdscr.addstr(0, 0, "┌" + "─"*(w-2) + "┐", colour)
-        hdr = HEADER + ("[LINK]" if connection_ok.is_set() else "[NO LINK]")
-        stdscr.addstr(1, 0, "│" + hdr.ljust(w-2)[:w-2] + "│", colour)
+        # header bar
+        header_str = HEADER + ("[● LINK]" if link_up_evt.is_set() else "[○ NO LINK]")
+        stdscr.addstr(0, 0, header_str.ljust(w)[:w], color)
 
-        # message pane
-        for i in range(pane_height):
-            y = 2 + i
-            idx = offset + i
-            if idx < len(messages):
-                src, txt = messages[idx]
-                line = f"{src}: {txt}"
-                stdscr.addstr(y, 0, line.ljust(w)[:w], colour)
+        # message area
+        for idx in range(pad_height):
+            row = idx + SCREEN_PAD
+            msg_idx = view_ofs + idx
+            if msg_idx >= len(msgs):
+                break
+            ts, src, text = msgs[msg_idx]
+            line = f"{fmt_ts(ts)} {src[:10]:>10} │ {text}"
+            stdscr.addstr(row, 0, line.ljust(w)[:w], color)
 
-        # footer
-        stdscr.addstr(h-2, 0, "└" + "─"*(w-2) + "┘", colour)
-        stdscr.addstr(h-1, 0, FOOTER.ljust(w)[:w], colour)
-
-        # if in SEND mode
-        if sending:
-            stdscr.addstr(h-1, 0, "Send> " + input_buf[-(w-6):], colour)
-            stdscr.move(h-1, 6 + len(input_buf[-(w-6):]))
+        # footer / prompt
+        if send_mode:
+            prompt = "Send> " + input_buf
+            stdscr.addstr(h - 1, 0, prompt.ljust(w)[:w], color)
+            stdscr.move(h - 1, min(w - 1, len(prompt)))
+        else:
+            stdscr.addstr(h - 1, 0, FOOTER.ljust(w)[:w], color)
 
         stdscr.refresh()
-        curses.napms(30)
+        curses.napms(25)
 
-        # input ----------------------------------------------------------
+        # -------- input handling -------------------------------------------
         try:
-            ch = stdscr.getch()
+            c = stdscr.getch()
         except curses.error:
             continue
 
-        if sending:
-            if ch in (curses.KEY_ENTER, 10, 13):
-                text_to_send = input_buf.strip()
+        if send_mode:
+            if c in (curses.KEY_ENTER, 10, 13):
+                text = input_buf.strip()
                 input_buf = ""
-                sending = False
-                if text_to_send:
-                    try:
-                        # quick optimistic echo to screen
-                        messages.append(("You", text_to_send))
-                        if connection_ok.is_set():
-                            # send asynchronously to avoid UI stall
-                            threading.Thread(
-                                target=iface_send,
-                                args=(text_to_send,),
-                                daemon=True
-                            ).start()
-                    except Exception as e:
-                        messages.append(("ERR", f"send failed: {e}"))
-            elif ch in (27,):                    # Esc abort
-                sending = False
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                send_mode = False
+                if text:
+                    ts = time.time()
+                    msgs.append((ts, "You", text))
+                    with db:
+                        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", text))
+                    outgoing_q.put(text)
+            elif c in (27,):                   # Esc abort
+                send_mode = False
+            elif c in (curses.KEY_BACKSPACE, 127, 8):
                 input_buf = input_buf[:-1]
-            elif 32 <= ch <= 126:               # printable ASCII
-                input_buf += chr(ch)
+            elif 32 <= c <= 126:
+                input_buf += chr(c)
             continue
 
-        # normal mode ----------------------------------------------------
-        if ch == curses.KEY_UP:
-            offset = max(0, offset - 1)
-        elif ch == curses.KEY_DOWN:
-            offset = min(max_offset, offset + 1)
-        elif ch == curses.KEY_MOUSE:
+        # ----- normal (view) mode -------
+        if c == curses.KEY_UP:
+            view_ofs = max(0, view_ofs - 1)
+        elif c == curses.KEY_DOWN:
+            view_ofs = min(max(0, len(msgs) - pad_height), view_ofs + 1)
+        elif c == curses.KEY_PPAGE:           # PgUp
+            view_ofs = max(0, view_ofs - pad_height)
+        elif c == curses.KEY_NPAGE:           # PgDn
+            view_ofs = min(max(0, len(msgs) - pad_height), view_ofs + pad_height)
+        elif c == curses.KEY_MOUSE:
             try:
-                _, mx, my, _, bstate = curses.getmouse()
-                if bstate & curses.BUTTON1_PRESSED:
+                _, mx, my, _, state = curses.getmouse()
+                if state & curses.BUTTON4_PRESSED:     # wheel up
+                    view_ofs = max(0, view_ofs - 3)
+                elif state & curses.BUTTON5_PRESSED:   # wheel down
+                    view_ofs = min(max(0, len(msgs) - pad_height), view_ofs + 3)
+                elif state & curses.BUTTON1_PRESSED:
                     drag_start_y = my
-                elif bstate & curses.BUTTON1_RELEASED:
-                    delta = my - drag_start_y
-                    offset = min(max_offset, max(0, offset - delta))
+                elif state & curses.BUTTON1_RELEASED:
+                    drag_end_y = my
+                    delta = drag_end_y - drag_start_y
+                    view_ofs = min(max(0, len(msgs) - pad_height),
+                                    max(0, view_ofs - delta))
             except Exception:
                 pass
-        elif ch in (ord('s'), ord('S')):
-            sending = True
+        elif c in (ord('s'), ord('S')):
+            send_mode = True
             input_buf = ""
-        elif ch in (ord('q'), ord('Q'), 27):     # q or Esc
-            stop_event.set()
+        elif c in (ord('q'), ord('Q'), 27):   # Esc/ Q
+            stop_evt.set()
 
-def iface_send(text: str):
-    """Send text on the wire – runs in its own thread."""
-    try:
-        # wait up to 5 s for a link if user pressed send too early
-        if not connection_ok.wait(5):
-            messages.append(("ERR", "radio not connected"))
-            return
-        # re‑open inside this thread: meshtastic requires per‑thread handle
-        iface = mserial.SerialInterface(devPath=DEV_PATH)
-        iface.sendText(text)
-        iface.close()
-    except Exception as e:
-        messages.append(("ERR", f"radio error: {e}"))
+###############################################################################
+# ── ENTRY POINT ──────────────────────────────────────────────────────────────
+###############################################################################
+def shutdown(*_sig):
+    stop_evt.set()
 
-# ── GRACEFUL SHUT‑DOWN ────────────────────────────────────────────────────────
-def sig_handler(sig, _):
-    stop_event.set()
-signal.signal(signal.SIGINT,  sig_handler)
-signal.signal(signal.SIGTERM, sig_handler)
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    radio = threading.Thread(target=radio_worker, daemon=True)
+    radio.start()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, shutdown)
+
     try:
-        curses.wrapper(run_ui)
+        curses.wrapper(ui)
     finally:
-        stop_event.set()
-        rt.join(timeout=2)
+        stop_evt.set()
+        radio.join(3)
         json_fh.close()
         db.close()
