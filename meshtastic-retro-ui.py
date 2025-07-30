@@ -1,277 +1,113 @@
 #!/usr/bin/env python3
-"""
-Retro Hacker-Style Meshtastic Terminal UI for Raspberry Pi (Terminal Only)
-Fix: Corrected callback signatures so connection event fires and UI no longer hangs at "Connecting".
-"""
-import locale
-locale.setlocale(locale.LC_ALL, '')
-
 import curses
 import json
 import sqlite3
+from meshtastic.ble_interface import BLEInterface
+from pubsub import pub
 import threading
-import time
-import os
-import stat
-from pathlib import Path
-from meshtastic.serial_interface import SerialInterface
-from pubsub import pub  # pip install pypubsub
 
-# --- CONFIGURATION ---
-HOME = Path.home()
-LOG_JSON = True
-LOG_SQLITE = True
-LOG_FILE = HOME / "meshtastic.log"
-DB_FILE = HOME / "meshtastic.db"
+# --- CONFIG ---
+LOG_JSON = True                   # append raw JSON to log file
+LOG_SQLITE = True                 # insert messages into SQLite
+LOG_FILE = "/home/rangerdan/meshtastic.log"
+DB_FILE  = "/home/rangerdan/meshtastic.db"
 DEV_PATH = "/dev/rfcomm0"
+NODE_ADDR = "48:CA:43:3C:51:FD"  # replace with your node's BLE address
 
-# --- GLOBALS ---
-messages = []            # list of (src, text)
-lock = threading.Lock()
-iface = None            # SerialInterface
-interface_ready = threading.Event()
-connection_status = "Starting…"
-json_fh = None
-db_conn = None
+# --- SETUP LOGGING ---
+if LOG_JSON:
+    json_fh = open(LOG_FILE, "a", encoding="utf-8")
 
-# --- DATABASE SETUP ---
-
-def setup_db():
-    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL,
-            src TEXT,
-            text TEXT
-        )
-        """
-    )
+if LOG_SQLITE:
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS messages (
+        ts   REAL,
+        src  TEXT,
+        text TEXT
+      )
+    """)
     conn.commit()
-    return conn
 
-# --- CALLBACKS (Correct signatures!) ---
+# --- MESHTASTIC CALLBACK ---
+messages = []
+def on_receive(packet, interface):
+    js = packet.get("decoded", {})
+    text = js.get("text")
+    src  = packet.get("from", {}).get("userAlias", "unknown")
+    if text:
+        ts = packet.get("timestamp", 0)/1000
+        messages.append((src, text))
+        if LOG_JSON:
+            json_fh.write(json.dumps(packet) + "\n")
+        if LOG_SQLITE:
+            conn.execute(
+              "INSERT INTO messages VALUES (?, ?, ?)",
+              (ts, src, text)
+            )
+            conn.commit()
 
-def on_receive(packet, interface, topic=pub.AUTO_TOPIC):
-    global db_conn, json_fh
-    d = getattr(packet, "decoded", None)
-    if d and getattr(d, "text", None):
-        txt = d.text
-        src = str(getattr(packet, "fromId", getattr(packet, "from_peer", "unknown")))
-        ts = getattr(packet, "rxTime", time.time())
-        with lock:
-            messages.append((src, txt))
-        if LOG_JSON and json_fh:
-            try:
-                json_fh.write(json.dumps({"ts": ts, "src": src, "text": txt}) + "\n")
-                json_fh.flush()
-            except:
-                pass
-        if LOG_SQLITE and db_conn:
-            try:
-                db_conn.execute(
-                    "INSERT INTO messages (ts, src, text) VALUES (?, ?, ?)",
-                    (ts, src, txt)
-                )
-                db_conn.commit()
-            except:
-                pass
-
-
-def on_connection(interface, topic=pub.AUTO_TOPIC):
-    global connection_status
-    connection_status = "Connected"
-    interface_ready.set()
-    with lock:
-        messages.append(("SYSTEM", "Connection established"))
-
-
-def on_lost_connection(interface, topic=pub.AUTO_TOPIC):
-    global connection_status
-    connection_status = "Disconnected"
-    interface_ready.clear()
-    with lock:
-        messages.append(("SYSTEM", "Connection lost"))
-
-# --- DEVICE CHECK ---
-
-
-def check_device():
-    if not os.path.exists(DEV_PATH):
-        return False
-    return stat.S_ISCHR(os.stat(DEV_PATH).st_mode)
-
-# --- SERIAL LISTENER THREAD ---
-
-def serial_listener():
-    global iface, connection_status
-    if not check_device():
-        connection_status = f"Device not found: {DEV_PATH}"
-        with lock:
-            messages.append(("SYSTEM", connection_status))
-        print(connection_status)  # Debug
-        return
-
-    connection_status = f"Connecting to {DEV_PATH}"
-    with lock:
-        messages.append(("SYSTEM", connection_status))
-    print(connection_status)  # Debug
-
-    # Register callbacks BEFORE creating SerialInterface
-    pub.subscribe(on_receive, "meshtastic.receive")
-    pub.subscribe(on_connection, "meshtastic.connection.established")
-    pub.subscribe(on_lost_connection, "meshtastic.connection.lost")
-
-    try:
-        print("Creating SerialInterface...")  # Debug
-        iface = SerialInterface(devPath=DEV_PATH)
-        print("SerialInterface created.")  # Debug
-    except Exception as e:
-        connection_status = f"Open error: {e}"
-        with lock:
-            messages.append(("SYSTEM", connection_status))
-        print(connection_status)  # Debug
-        return
-
-    # Block until connected or timeout
-    print("Waiting for connection...")  # Debug
-    if not iface.waitForConnection(timeoutSecs=15):
-        connection_status = "Connection timeout"
-        with lock:
-            messages.append(("SYSTEM", "Unable to connect"))
-        print("Connection timeout")  # Debug
-        return
-    # waitForConnection sets isConnected but we rely on on_connection to set event; fallback:
-    if not interface_ready.is_set():
-        print("on_connection fallback")  # Debug
-        on_connection(iface)
-
-    while interface_ready.is_set():
-        time.sleep(1)
-
-# --- MESSAGE SENDER ---
-
-
-def send_message(txt):
-    if not iface or not interface_ready.is_set():
-        return False, "Not ready"
-    try:
-        iface.sendText(txt)
-        with lock:
-            messages.append(("You", txt))
-        return True, "Sent"
-    except Exception as e:
-        return False, f"Error: {e}"
-
-# --- CURSES UI LOOP ---
-
+# --- UI ---
 def run_ui(stdscr):
-    global json_fh, db_conn
     curses.curs_set(0)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, -1)
-    curses.init_pair(2, curses.COLOR_RED, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    stdscr.nodelay(True)
     stdscr.keypad(True)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
 
-    if LOG_JSON:
-        try:
-            json_fh = open(LOG_FILE, "a", encoding="utf-8")
-        except:
-            pass
-    if LOG_SQLITE:
-        db_conn = setup_db()
+    # Colors: green on black for retro feel
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
-    threading.Thread(target=serial_listener, daemon=True).start()
+    iface = BLEInterface(address=NODE_ADDR)
+    pub.subscribe(on_receive, "meshtastic.receive")
+    threading.Thread(target=iface.loop_forever, daemon=True).start()
 
     offset = 0
-    status_msg = ""
-    status_color = 1
-
     while True:
         h, w = stdscr.getmaxyx()
         stdscr.erase()
 
-        # Header
+        # Header & Footer
         stdscr.attron(curses.color_pair(1))
-        stdscr.addstr(0, 0, "╔" + "═"*(w-2) + "╗")
-        header = f" RetroMeshtastic — {connection_status}"
-        stdscr.addstr(1, 0, "║" + header.ljust(w-2) + "║")
-        stdscr.addstr(2, 0, "╠" + "═"*(w-2) + "╣")
+        stdscr.addstr(0, 0, "╔" + ("═"*(w-2)) + "╗")
+        stdscr.addstr(1, 0, "║ RetroMeshtastic Badge — Touch or ↑/↓ to scroll ║".ljust(w-1) + "║")
+        stdscr.addstr(h-2, 0, "╚" + ("═"*(w-2)) + "╝")
+        stdscr.addstr(h-1, 0, "Press 's' to send | Ctrl-C to exit".ljust(w-1))
         stdscr.attroff(curses.color_pair(1))
 
-        with lock:
-            total = len(messages)
-            max_off = max(0, total - (h - 6))
-            offset = min(offset, max_off)
-            view = messages[offset:offset + (h - 6)]
-        for i, (src, txt) in enumerate(view):
-            clr = curses.color_pair(3) if src == "You" else curses.color_pair(1)
-            if src in ("SYSTEM", "ERROR"):
-                clr = curses.color_pair(2)
-            stdscr.addstr(3 + i, 1, f"{src[:12]}: {txt}"[:w-2], clr)
+        # Message window inside box
+        for i in range(min(len(messages)-offset, h-4)):
+            src, txt = messages[offset+i]
+            line = f"{src[:10]}: {txt}"
+            stdscr.addstr(2+i, 1, line[:w-2], curses.color_pair(1))
 
-        if status_msg:
-            stdscr.addstr(h-3, 1, status_msg[:w-2], curses.color_pair(status_color))
-
-        stdscr.attron(curses.color_pair(1))
-        stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝")
-        stdscr.attroff(curses.color_pair(1))
-        stdscr.addstr(h-1, 0, "Press s/send | ↑/↓ scroll | Ctrl-C exit".ljust(w-1))
         stdscr.refresh()
+        curses.napms(50)
 
-        ch = stdscr.getch()
+        # Input handling
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            continue
+
         if ch == curses.KEY_UP:
-            offset = max(0, offset - 1)
+            offset = max(0, offset-1)
         elif ch == curses.KEY_DOWN:
-            offset = min(max_off, offset + 1)
+            offset = min(max(0, len(messages)-(h-4)), offset+1)
+        elif ch == curses.KEY_MOUSE:
+            _, mx, my, _, _ = curses.getmouse()
+            if my < h//2:
+                offset = max(0, offset-1)
+            else:
+                offset = min(max(0, len(messages)-(h-4)), offset+1)
         elif ch in (ord('s'), ord('S')):
-            if not interface_ready.is_set():
-                status_msg, status_color = "Not connected", 2
-                continue
-            curses.echo(); curses.curs_set(1)
-            stdscr.addstr(h-1, 0, "Send: ".ljust(w-1)); stdscr.refresh()
-            try:
-                inp = stdscr.getstr(h-1, 6, w-7).decode().strip()
-                if inp:
-                    ok, res = send_message(inp)
-                    status_msg, status_color = res, 1 if ok else 2
-                else:
-                    status_msg, status_color = "Empty message", 3
-            except Exception:
-                status_msg, status_color = "Input error", 2
-            curses.noecho(); curses.curs_set(0)
-        elif ch == 3:  # Ctrl+C
-            break
-        time.sleep(0.1)
-
-# --- CLEANUP ---
-
-def cleanup():
-    global iface, json_fh, db_conn
-    if iface:
-        try:
-            iface.close()
-        except:
-            pass
-    if json_fh:
-        try:
-            json_fh.close()
-        except:
-            pass
-    if db_conn:
-        try:
-            db_conn.close()
-        except:
-            pass
+            curses.echo()
+            stdscr.addstr(h-1, 0, "Send: ".ljust(w-1))
+            txt = stdscr.getstr(h-1, 6, w-8).decode()
+            curses.noecho()
+            if txt:
+                iface.sendText(txt)
+                messages.append(("You", txt))
 
 if __name__ == "__main__":
-    try:
-        curses.wrapper(run_ui)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cleanup()
-        print("RetroMeshtastic closed.")
+    curses.wrapper(run_ui)
