@@ -116,15 +116,34 @@ def run_ui(stdscr):
                 bottom = max(0, len(messages) - (h-4))
             offset = min(bottom, offset + 1)
         elif ch in (ord('s'), ord('S')):
-            if iface:                    # may be None if radio not ready
+            if iface:  # only if the radio’s ready
+                # 1) Show the cursor and let getstr() block
+                curses.curs_set(1)
+                stdscr.nodelay(False)
+
+                # 2) Echo your typing and draw the prompt
                 curses.echo()
-                stdscr.addstr(h-1, 0, "Send: ".ljust(w-1))
-                txt = stdscr.getstr(h-1, 6, w-8).decode()
-                curses.noecho()
+                stdscr.addstr(h-1, 0, "Send: ".ljust(w-1), curses.color_pair(1))
+                stdscr.move(h-1, 6)
+                stdscr.refresh()
+
+                # 3) Actually read the line (blocks until Enter)
+                try:
+                    txt = stdscr.getstr(h-1, 6, w-8).decode()
+                except Exception:
+                    txt = ""
+                finally:
+                    # 4) Turn echo & cursor back off, restore non‑blocking
+                    curses.noecho()
+                    curses.curs_set(0)
+                    stdscr.nodelay(True)
+
+                # 5) If you typed something, send it
                 if txt:
                     iface.sendText(txt)
                     with lock:
                         messages.append(("You", txt))
+
 
 if __name__ == "__main__":
     curses.wrapper(run_ui)
