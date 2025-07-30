@@ -11,8 +11,8 @@ from meshtastic.serial_interface import SerialInterface
 from pubsub import pub           # pip install pypubsub
 
 # --- CONFIG ---
-LOG_JSON   = True                # append raw JSON to log file
-LOG_SQLITE = True                # insert messages into SQLite
+LOG_JSON   = True
+LOG_SQLITE = True
 HOME       = Path.home()
 LOG_FILE   = HOME / "meshtastic.log"
 DB_FILE    = HOME / "meshtastic.db"
@@ -26,7 +26,7 @@ if LOG_JSON:
     try:
         json_fh = open(LOG_FILE, "a", encoding="utf-8")
     except Exception as e:
-        print(f"Warning: Could not open log file: {e}", file=sys.stderr)
+        print(f"Warning: log file open failed: {e}", file=sys.stderr)
 
 if LOG_SQLITE:
     try:
@@ -40,19 +40,17 @@ if LOG_SQLITE:
         """)
         conn.commit()
     except Exception as e:
-        print(f"Warning: Could not setup SQLite: {e}", file=sys.stderr)
+        print(f"Warning: sqlite setup failed: {e}", file=sys.stderr)
 
-# --- GLOBAL STATE ---
-messages         = []
-lock             = threading.Lock()
-iface            = None
-interface_ready  = threading.Event()
-connection_status = "Initializing…"
+# --- GLOBALS ---
+messages          = []
+lock              = threading.Lock()
+iface             = None
+interface_ready   = threading.Event()
+connection_status = "Idle"
 
 # --- CALLBACKS ---
 def on_receive(packet, topic=pub.AUTO_TOPIC):
-    """Called for every Meshtastic packet."""
-    global messages, json_fh, conn
     try:
         decoded = getattr(packet, "decoded", None)
         if decoded and getattr(decoded, "text", None):
@@ -63,10 +61,10 @@ def on_receive(packet, topic=pub.AUTO_TOPIC):
                 messages.append((src, text))
             if LOG_JSON and json_fh:
                 json_fh.write(json.dumps({
-                    "timestamp": ts,
+                    "ts":        ts,
                     "from":      src,
                     "text":      text,
-                    "raw":       str(packet)
+                    "raw_packet": str(packet)
                 }) + "\n")
                 json_fh.flush()
             if LOG_SQLITE and conn:
@@ -77,34 +75,36 @@ def on_receive(packet, topic=pub.AUTO_TOPIC):
             messages.append(("ERROR", f"on_receive error: {e}"))
 
 def on_connection(interface, topic=pub.AUTO_TOPIC):
-    """Fired when Meshtastic link is up."""
     global connection_status
     connection_status = "Connected"
     interface_ready.set()
 
 def on_lost_connection(interface, topic=pub.AUTO_TOPIC):
-    """Fired when Meshtastic link is lost."""
     global connection_status
     connection_status = "Disconnected"
     interface_ready.clear()
 
-# --- INIT INTERFACE ---
+# --- INITIALIZE MESHTASTIC IN BG THREAD ---
 def init_interface():
-    """Subscribe to topics and open the RFCOMM link."""
     global iface, connection_status
-    # 1) Subscribe callbacks
-    pub.subscribe(on_receive,             "meshtastic.receive")
-    pub.subscribe(on_connection,          "meshtastic.connection.established")
-    pub.subscribe(on_lost_connection,     "meshtastic.connection.lost")
-    # 2) Open link (spawns its own I/O thread)
-    connection_status = f"Opening {DEV_PATH}…"
-    iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
+    # subscribe to events
+    pub.subscribe(on_receive,         "meshtastic.receive")
+    pub.subscribe(on_connection,      "meshtastic.connection.established")
+    pub.subscribe(on_lost_connection, "meshtastic.connection.lost")
 
-# --- UI & MAIN LOOP ---
+    connection_status = f"Opening {DEV_PATH}…"
+    try:
+        iface = SerialInterface(devPath=DEV_PATH, connectNow=True)
+    except Exception as e:
+        connection_status = f"Open error: {e}"
+        return
+
+    # after connectNow, let the callbacks drive status
+
+# --- UI & SENDING ---
 def send_message(text):
-    """Helper to send a message."""
     if not iface or not interface_ready.is_set():
-        return False, "Interface not ready"
+        return False, "Not ready"
     try:
         iface.sendText(text)
         with lock:
@@ -115,6 +115,7 @@ def send_message(text):
 
 def run_ui(stdscr):
     global connection_status
+
     # Curses setup
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -124,16 +125,12 @@ def run_ui(stdscr):
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
-    # Kick off Meshtastic
-    init_interface()
+    # Kick off Meshtastic connect in background
+    threading.Thread(target=init_interface, daemon=True).start()
     connection_status = "Connecting…"
-    if not interface_ready.wait(timeout=10):
-        connection_status = "Timeout – check RFCOMM"
-    else:
-        connection_status = "Connected"
 
-    offset = 0
-    status_msg  = ""
+    offset       = 0
+    status_msg   = ""
     status_color = 1
 
     while True:
@@ -149,23 +146,23 @@ def run_ui(stdscr):
 
         # Messages
         with lock:
-            total = len(messages)
-            max_off = max(0, total - (h-5))
-            offset = min(offset, max_off)
-            view = messages[offset : offset + (h-5)]
+            total    = len(messages)
+            max_off  = max(0, total - (h-5))
+            offset   = min(offset, max_off)
+            view     = messages[offset : offset + (h-5)]
         for i, (src, txt) in enumerate(view):
-            color = curses.color_pair(3) if src == "You" else curses.color_pair(1)
+            clr = curses.color_pair(3) if src == "You" else curses.color_pair(1)
             if src in ("ERROR", "SYSTEM"):
-                color = curses.color_pair(2)
+                clr = curses.color_pair(2)
             line = f"{src[:12]}: {txt}"
-            stdscr.addstr(2+i, 1, line[:w-2], color)
+            stdscr.addstr(2+i, 1, line[:w-2], clr)
 
-        # Footer
+        # Status line + Footer
         if status_msg:
             stdscr.addstr(h-3, 1, status_msg[:w-2], curses.color_pair(status_color))
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(h-2, 0, "╚" + ("═"*(w-2)) + "╝")
-        stdscr.addstr(h-1, 0, "Press 's' to send | ↑/↓ scroll | Ctrl-C to exit".ljust(w-1))
+        stdscr.addstr(h-1, 0, "Press 's' to send | ↑/↓ scroll | Ctrl-C exit".ljust(w-1))
         stdscr.attroff(curses.color_pair(1))
 
         stdscr.refresh()
@@ -182,20 +179,17 @@ def run_ui(stdscr):
         elif ch in (ord('s'), ord('S')):
             status_msg = ""
             if not interface_ready.is_set():
-                status_msg, status_color = "Not ready", 2
+                status_msg, status_color = "Interface not ready", 2
                 continue
-            # get user input
-            stdscr.timeout(-1)
-            curses.echo()
-            curses.curs_set(1)
+            curses.echo(); curses.curs_set(1); stdscr.timeout(-1)
             stdscr.addstr(h-1, 0, "Send: ".ljust(w-1)); stdscr.refresh()
             txt = stdscr.getstr(h-1, 6, w-8).decode().strip()
             curses.noecho(); curses.curs_set(0); stdscr.timeout(100)
             if txt:
                 ok, res = send_message(txt)
-                status_msg, status_color = ("Sent", 1) if ok else (res, 2)
+                status_msg, status_color = (res, 1) if ok else (res, 2)
             else:
-                status_msg, status_color = ("Empty, not sent", 3)
+                status_msg, status_color = ("Empty – not sent", 3)
         elif ch == 3:  # Ctrl-C
             break
 
