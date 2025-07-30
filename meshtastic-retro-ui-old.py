@@ -1,113 +1,162 @@
 #!/usr/bin/env python3
+"""
+Retro Hacker-Style Meshtastic Terminal UI for Raspberry Pi
+- Connects via Bluetooth to Meshtastic node at /dev/rfcomm0
+- Terminal-only (curses) interface on a 3.5" touchscreen
+- Scroll through received messages
+- Press 's' to send a message
+- Press Ctrl+C to exit
+- Saves all messages to local SQLite database for later analysis
+"""
 import curses
-import json
 import sqlite3
-from meshtastic.ble_interface import BLEInterface
-from pubsub import pub
 import threading
+import time
+import traceback
+from meshtastic.serial_interface import SerialInterface
+from meshtastic.packet_pb2 import Packet  # if needed for type hints
 
-# --- CONFIG ---
-LOG_JSON = True                   # append raw JSON to log file
-LOG_SQLITE = True                 # insert messages into SQLite
-LOG_FILE = "/home/rangerdan/meshtastic.log"
-DB_FILE  = "/home/rangerdan/meshtastic.db"
+# --- CONFIGURATION ---
 DEV_PATH = "/dev/rfcomm0"
-NODE_ADDR = "00:11:22:33:44:55"  # replace with your node's BLE address
+DB_FILE = "/home/pi/meshtastic.db"
+RECONNECT_DELAY = 5  # seconds before reconnect attempt
 
-# --- SETUP LOGGING ---
-if LOG_JSON:
-    json_fh = open(LOG_FILE, "a", encoding="utf-8")
+# Shared state
+messages = []            # list of tuples: (timestamp, source, text)
+msg_lock = threading.Lock()
+scroll_pos = 0          # how many messages back from the bottom to start view
+iface = None            # SerialInterface instance
+db_conn = None          # sqlite3 connection
 
-if LOG_SQLITE:
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS messages (
-        ts   REAL,
-        src  TEXT,
-        text TEXT
-      )
-    """)
+
+def setup_db():
+    """Initialize SQLite database and return connection"""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c = conn.cursor()
+    c.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            src TEXT,
+            text TEXT
+        )
+        '''
+    )
     conn.commit()
+    return conn
 
-# --- MESHTASTIC CALLBACK ---
-messages = []
-def on_receive(packet, interface):
-    js = packet.get("decoded", {})
-    text = js.get("text")
-    src  = packet.get("from", {}).get("userAlias", "unknown")
-    if text:
-        ts = packet.get("timestamp", 0)/1000
-        messages.append((src, text))
-        if LOG_JSON:
-            json_fh.write(json.dumps(packet) + "\n")
-        if LOG_SQLITE:
-            conn.execute(
-              "INSERT INTO messages VALUES (?, ?, ?)",
-              (ts, src, text)
-            )
-            conn.commit()
 
-# --- UI ---
-def run_ui(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+def insert_message(conn, timestamp, src, text):
+    """Insert a received message into the database"""
+    try:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO messages (timestamp, src, text) VALUES (?, ?, ?)',
+            (timestamp, src, text)
+        )
+        conn.commit()
+    except Exception:
+        # In production, log somewhere; here we just ignore db failures
+        pass
 
-    # Colors: green on black for retro feel
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
-    iface = BLEInterface(address=NODE_ADDR)
-    pub.subscribe(on_receive, "meshtastic.receive")
-    threading.Thread(target=iface.loop_forever, daemon=True).start()
+def on_receive(packet: Packet = None, interface=None, **kwargs):
+    """Meshtastic callback for incoming packets"""
+    try:
+        ts = time.time()
+        # source user or node ID
+        src = packet.uplink or packet.from_node or "unknown"
+        # decoded text
+        text = packet.decoded.text if packet.decoded and hasattr(packet.decoded, 'text') else ''
+        with msg_lock:
+            messages.append((ts, src, text))
+        insert_message(db_conn, ts, src, text)
+    except Exception:
+        # keep UI alive on callback error
+        traceback.print_exc()
 
-    offset = 0
+
+def connect():
+    """Attempt to connect to the Meshtastic node, retry on failure"""
+    global iface
     while True:
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-
-        # Header & Footer
-        stdscr.attron(curses.color_pair(1))
-        stdscr.addstr(0, 0, "╔" + ("═"*(w-2)) + "╗")
-        stdscr.addstr(1, 0, "║ RetroMeshtastic Badge — Touch or ↑/↓ to scroll ║".ljust(w-1) + "║")
-        stdscr.addstr(h-2, 0, "╚" + ("═"*(w-2)) + "╝")
-        stdscr.addstr(h-1, 0, "Press 's' to send | Ctrl-C to exit".ljust(w-1))
-        stdscr.attroff(curses.color_pair(1))
-
-        # Message window inside box
-        for i in range(min(len(messages)-offset, h-4)):
-            src, txt = messages[offset+i]
-            line = f"{src[:10]}: {txt}"
-            stdscr.addstr(2+i, 1, line[:w-2], curses.color_pair(1))
-
-        stdscr.refresh()
-        curses.napms(50)
-
-        # Input handling
         try:
-            ch = stdscr.getch()
-        except curses.error:
-            continue
+            iface = SerialInterface(devPath=DEV_PATH)
+            iface.onReceive += on_receive
+            return
+        except Exception as e:
+            print(f"[!] Connection failed: {e}. Retrying in {RECONNECT_DELAY}s...")
+            time.sleep(RECONNECT_DELAY)
 
-        if ch == curses.KEY_UP:
-            offset = max(0, offset-1)
-        elif ch == curses.KEY_DOWN:
-            offset = min(max(0, len(messages)-(h-4)), offset+1)
-        elif ch == curses.KEY_MOUSE:
-            _, mx, my, _, _ = curses.getmouse()
-            if my < h//2:
-                offset = max(0, offset-1)
-            else:
-                offset = min(max(0, len(messages)-(h-4)), offset+1)
-        elif ch in (ord('s'), ord('S')):
-            curses.echo()
-            stdscr.addstr(h-1, 0, "Send: ".ljust(w-1))
-            txt = stdscr.getstr(h-1, 6, w-8).decode()
-            curses.noecho()
-            if txt:
-                iface.sendText(txt)
-                messages.append(("You", txt))
 
-if __name__ == "__main__":
-    curses.wrapper(run_ui)
+def input_message(stdscr):
+    """Prompt user for a message and send via Meshtastic"""
+    global iface
+    height, width = stdscr.getmaxyx()
+    prompt = "Enter message: "
+    curses.echo()
+    curses.curs_set(1)
+    stdscr.addstr(height - 1, 0, prompt)
+    stdscr.clrtoeol()
+    msg = stdscr.getstr(height - 1, len(prompt), width - len(prompt) - 1)
+    curses.noecho()
+    curses.curs_set(0)
+    try:
+        text = msg.decode('utf-8')
+        iface.sendText(text)
+    except Exception:
+        pass
+
+
+def draw_ui(stdscr):
+    """Render messages list and UI controls"""
+    global scroll_pos
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    display_height = height - 2
+    with msg_lock:
+        total = len(messages)
+        start = max(0, total - display_height - scroll_pos)
+        end = max(0, total - scroll_pos)
+        view = messages[start:end]
+    for idx, (ts, src, text) in enumerate(view[-display_height:]):
+        timestamp = time.strftime('%H:%M:%S', time.localtime(ts))
+        line = f"{timestamp} {src}: {text}"[:width - 1]
+        stdscr.addstr(idx, 0, line)
+    # draw separator and help
+    stdscr.hline(display_height, 0, '-', width)
+    help_text = "s: send | ↑/↓: scroll | Ctrl+C: exit"
+    stdscr.addstr(display_height + 1, 0, help_text[:width - 1])
+    stdscr.refresh()
+
+
+def main(stdscr):
+    """Main entry point for curses wrapper"""
+    global db_conn, scroll_pos
+    curses.curs_set(0)
+    curses.use_default_colors()
+    stdscr.nodelay(True)
+    db_conn = setup_db()
+    connect()
+    # run UI loop
+    while True:
+        draw_ui(stdscr)
+        try:
+            key = stdscr.getch()
+            if key == ord('s'):
+                input_message(stdscr)
+            elif key == curses.KEY_UP:
+                scroll_pos = min(scroll_pos + 1, max(0, len(messages) - 1))
+            elif key == curses.KEY_DOWN:
+                scroll_pos = max(scroll_pos - 1, 0)
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            # swallow unexpected UI errors
+            traceback.print_exc()
+
+
+if __name__ == '__main__':
+    curses.wrapper(main)
