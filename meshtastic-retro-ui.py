@@ -212,18 +212,23 @@ def send_message(text):
 
 def run_ui(stdscr):
     """Main UI loop"""
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
-    
-    # Colors: green on black for retro feel
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    
-    # Start the serial listener thread
-    threading.Thread(target=serial_listener, daemon=True).start()
+    global iface, connection_status
+    try:
+        # Bind directly to /dev/rfcomm0
+        iface = SerialInterface(devPath=DEV_PATH)
+        # Attach callbacks just like before
+        iface.onReceive(on_receive)
+        iface.onConnection(on_connection)
+        iface.onLostConnection(on_lost_connection)
+
+        connection_status = "Connecting…"
+        # Wait up to 5 s for iface to fire onConnection
+        if not interface_ready.wait(timeout=5):
+            connection_status = "Connection timeout"
+        else:
+            connection_status = "Connected"
+    except Exception as e:
+        connection_status = f"Connection error: {e}"
     
     offset = 0
     status_message = ""
