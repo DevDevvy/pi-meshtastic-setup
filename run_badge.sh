@@ -2,12 +2,15 @@
 # ----------------------------------------------------------------------
 # Wrapper that:
 #   • Brings up the BLE adapter
+#   • Verifies it can talk to your node
 #   • Activates the Python venv
-#   • Launches the curses UI (now using BLEInterface)
+#   • Launches the curses UI (using BLEInterface)
 # Called automatically by systemd (see setup.sh)
 # ----------------------------------------------------------------------
 set -euo pipefail
 
+# ── CONFIG ────────────────────────────────────────────────────────────────
+MESHTASTIC_BLE_ADDR="48:CA:43:3C:51:FD"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$PROJECT_DIR/venv"
 UI="$PROJECT_DIR/meshtastic-retro-ui.py"
@@ -17,15 +20,17 @@ echo "🐍 Python executable: $VENV/bin/python"
 "$VENV/bin/python" --version
 
 echo "🔧 Bringing up BLE adapter (hci0)…"
-# Make sure Bluetooth is powered on
 sudo rfkill unblock bluetooth
 hciconfig hci0 up || true
 
-echo "🔎 MESHTASTIC_BLE_ADDR: ${MESHTASTIC_BLE_ADDR:-not set}"
-# Reminder: export MESHTASTIC_BLE_ADDR=11:22:33:44:55:66 (your node's BLE MAC)
+echo "🔎 Verifying BLE connection to $MESHTASTIC_BLE_ADDR…"
+# Use the Meshtastic CLI in the venv to test reachability
+if ! "$VENV/bin/meshtastic" --ble "$MESHTASTIC_BLE_ADDR" --info >/dev/null 2>&1; then
+  echo "❌  Unable to reach Meshtastic node at $MESHTASTIC_BLE_ADDR – aborting."
+  exit 1
+fi
+echo "✅  Node reachable over BLE."
 
-# Activate venv & launch UI
-# shellcheck disable=SC1090
+# ── Launch UI ───────────────────────────────────────────────────────────────
 source "$VENV/bin/activate"
-
 exec python "$UI"
