@@ -18,6 +18,7 @@ import sys
 
 from meshtastic.ble_interface import BLEInterface, BLEScanner  # from venv
 from pubsub import pub                            # from venv
+from meshtastic.util import detect_supported_devices, active_ports_on_supported_devices  # <-- add this import
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DEV_PATH = os.getenv("MESHTASTIC_DEV", "/dev/rfcomm0")
@@ -65,16 +66,22 @@ pub.subscribe(lambda _: link_up_evt.clear(), "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 def _find_ble_node():
-    """Scan for a Meshtastic node and return its BLE address."""
-    json_fh.write("# Scanning for BLE Meshtastic nodes...\n")
-    scanner = BLEScanner()
-    found = scanner.scan(timeout=10)
-    for dev in found:
-        # Try to match by name or service UUID
-        if "Meshtastic" in dev.name or dev.name.startswith("MT-"):
-            json_fh.write(f"# Found Meshtastic node: {dev.address} ({dev.name})\n")
-            return dev.address
-    json_fh.write("# No Meshtastic BLE node found during scan.\n")
+    """Scan for a Meshtastic node and return its BLE address using meshtastic.util."""
+    json_fh.write("# Scanning for supported Meshtastic devices...\n")
+    sds = detect_supported_devices()
+    if len(sds) > 0:
+        json_fh.write(f"# Detected possible devices: {len(sds)}\n")
+        for d in sds:
+            json_fh.write(f"# name:{d.name}{d.version} firmware:{d.for_firmware}\n")
+        ports = active_ports_on_supported_devices(sds)
+        json_fh.write(f"# ports:{ports}\n")
+        # Try to return the BLE address if available
+        for d in sds:
+            if hasattr(d, "ble_address") and d.ble_address:
+                json_fh.write(f"# Found BLE address: {d.ble_address}\n")
+                return d.ble_address
+    else:
+        json_fh.write("# No supported Meshtastic devices found during scan.\n")
     return None
 
 def _radio_worker():
