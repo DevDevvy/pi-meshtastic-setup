@@ -9,20 +9,15 @@ Retro Meshtastic Badge – 3.5″ Touch, Headless Edition
 • Quit with Ctrl-C or Q
 • Persists to ~/.retrobadge/{meshtastic.db,meshtastic.log}
 """
-
 import os, json, sqlite3, signal, queue, threading, time, curses
 from pathlib import Path
 from datetime import datetime
-import getpass
-import sys
+import getpass, sys
 
-from meshtastic.ble_interface import BLEInterface, BLEScanner  # from venv
-from pubsub import pub                            # from venv
-from meshtastic.util import detect_supported_devices, active_ports_on_supported_devices  # <-- add this import
+from meshtastic.ble_interface import BLEInterface
+from pubsub import pub
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-DEV_PATH = os.getenv("MESHTASTIC_DEV", "/dev/rfcomm0")
-BAUD     = int(os.getenv("MESHTASTIC_BAUD", "921600"))  # Add this line
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
@@ -66,38 +61,31 @@ pub.subscribe(lambda _: link_up_evt.clear(), "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 def _find_ble_node():
-    """Scan for a Meshtastic node and return its BLE address using meshtastic.util."""
-    json_fh.write("# Scanning for supported Meshtastic devices...\n")
-    sds = detect_supported_devices()
-    if len(sds) > 0:
-        json_fh.write(f"# Detected possible devices: {len(sds)}\n")
-        for d in sds:
-            json_fh.write(f"# name:{d.name}{d.version} firmware:{d.for_firmware}\n")
-        ports = active_ports_on_supported_devices(sds)
-        json_fh.write(f"# ports:{ports}\n")
-        # Try to return the BLE address if available
-        for d in sds:
-            if hasattr(d, "ble_address") and d.ble_address:
-                json_fh.write(f"# Found BLE address: {d.ble_address}\n")
-                return d.ble_address
-    else:
-        json_fh.write("# No supported Meshtastic devices found during scan.\n")
-    return None
+    """Scan for available Meshtastic BLE devices and return the first address."""
+    json_fh.write("# Scanning for BLE devices…\n")
+    devices = BLEInterface.scan()                                  # Static scan method :contentReference[oaicite:1]{index=1}
+    json_fh.write(f"# Found {len(devices)} BLE devices.\n")
+    for d in devices:
+        json_fh.write(f"#   • {d.name} @ {d.address}\n")
+    return devices[0].address if devices else None
 
 def _radio_worker():
     global _iface
-    addr = NODE_ADDR
+    addr = NODE_ADDR or _find_ble_node()
     while not stop_evt.is_set():
         try:
-            # Log connection attempt
-            json_fh.write(f"# Trying BLE address: {addr}\n")
-            iface = BLEInterface(address=addr)
-            if not iface.waitForConfig(timeout=15):
-                raise RuntimeError("Node config timeout")
+            json_fh.write(f"# Attempting BLE connection to: {addr}\n")
+            iface = BLEInterface(address=addr)                      # BLEInterface __init__ does the work :contentReference[oaicite:2]{index=2}
             with _iface_lock:
                 _iface = iface
 
-            # dispatch outbound messages
+            # Wait for the pubsub event that signals connection established
+            json_fh.write("# Waiting for BLE link-up event…\n")
+            if not link_up_evt.wait(timeout=15):
+                raise RuntimeError("BLE link up timed out")
+
+            json_fh.write("# BLE link is up, entering main loop.\n")
+            # Dispatch outgoing messages
             while not stop_evt.wait(0.1):
                 try:
                     msg = outgoing_q.get_nowait()
@@ -106,21 +94,21 @@ def _radio_worker():
                     pass
 
         except Exception as e:
-            json_fh.write(f"# radio error: {e}\n")
+            json_fh.write(f"# Radio error: {e}\n")
             link_up_evt.clear()
-            # Try scanning for node if connection failed
-            scan_addr = _find_ble_node()
-            if scan_addr and scan_addr != addr:
-                addr = scan_addr
-                json_fh.write(f"# Switching to found BLE address: {addr}\n")
-            time.sleep(5)
-        finally:
+            # Clean up the old interface
             with _iface_lock:
                 if _iface:
                     try: _iface.close()
                     except: pass
-                _iface = None
+                    _iface = None
 
+            # Try to discover a new address if we lost the previous one
+            new_addr = _find_ble_node()
+            if new_addr and new_addr != addr:
+                addr = new_addr
+                json_fh.write(f"# Switching to BLE address: {addr}\n")
+            time.sleep(5)
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M")
@@ -269,16 +257,7 @@ def _ui(stdscr):
 def _sig(*_): stop_evt.set()
 
 def main():
-    # Diagnostics
-    json_fh.write(f"# Running as user: {getpass.getuser()}\n")
-    json_fh.write(f"# Python executable: {sys.executable}\n")
-    json_fh.write(f"# Checking /dev/rfcomm0 permissions...\n")
-    try:
-        st = os.stat(DEV_PATH)
-        json_fh.write(f"# /dev/rfcomm0 mode: {oct(st.st_mode)} owner: {st.st_uid} group: {st.st_gid}\n")
-    except Exception as e:
-        json_fh.write(f"# Could not stat /dev/rfcomm0: {e}\n")
-
+    # Diagnostics…
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
     threading.Thread(target=_radio_worker, daemon=True).start()
