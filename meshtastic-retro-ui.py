@@ -114,6 +114,15 @@ def _history(limit=2000):
 ###############################################################################
 # Curses UI
 ###############################################################################
+# ── utility: never overflow bottom‑right ────────────────────────────
+def safe_footer(win, row, text, attr):
+    """Write a footer line without touching the last screen cell."""
+    h, w = win.getmaxyx()
+    safe = text.ljust(w - 1)[: w - 1]   # <=  w‑1 chars
+    try:
+        win.addstr(row, 0, safe, attr)
+    except curses.error:
+        pass                             # ignore if terminal resizes mid‑draw
 def _ui(stdscr):
     curses.curs_set(0)
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
@@ -156,10 +165,10 @@ def _ui(stdscr):
         # footer or prompt
         if send_mode:
             prompt = f"Send> {inp}"
-            stdscr.addstr(h-1, 0, prompt.ljust(w)[:w], colour)
+            safe_footer(stdscr, h - 1, prompt, colour)
             stdscr.move(h-1, min(len(prompt), w-1))
         else:
-            stdscr.addstr(h-1, 0, FOOTER.ljust(w)[:w], colour)
+            safe_footer(stdscr, h - 1, FOOTER, colour)
 
         stdscr.refresh(); curses.napms(30)
 

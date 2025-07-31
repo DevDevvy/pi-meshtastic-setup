@@ -33,3 +33,5 @@ sudo ./setup.sh                   # installs everything & enables service
 sudo ./pair-meshtastic.sh AA:BB:CC:DD:EE:FF   # once, with your node MAC
 sudo reboot
 ```
+
+NOTE: Be sure to change the MAC address in run_badge.sh
