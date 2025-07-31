@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-set -e
-DEVICE_MAC="AA:BB:CC:DD:EE:FF"   # ← your Heltec V3 MAC
+# ----------------------------------------------------------------------
+# One‑time helper to pair a Meshtastic node and bind /dev/rfcomm0
+# Usage: sudo ./pair-meshtastic.sh AA:BB:CC:DD:EE:FF
+# ----------------------------------------------------------------------
+set -euo pipefail
 
-sudo bluetoothctl <<EOF
+MAC="${1:-}"
+if [[ -z "$MAC" ]]; then
+  echo "Usage: sudo $0 <NODE-BT-MAC>"
+  exit 1
+fi
+
+echo "🪄  Pairing $MAC … (follow prompts)"
+bluetoothctl <<EOF
 power on
 agent on
 default-agent
-scan on
+trust $MAC
+pair  $MAC
+quit
 EOF
 
-# Give it a few seconds to discover the device
-sleep 3
+echo "🔗  Binding /dev/rfcomm0 to channel 1"
+rfcomm bind /dev/rfcomm0 "$MAC" 1 || {
+  echo "❌  rfcomm bind failed"; exit 1; }
 
-sudo bluetoothctl <<EOF
-scan off
-pair $DEVICE_MAC
-trust $DEVICE_MAC
-connect $DEVICE_MAC
-exit
-EOF
-
-# Now bind RFCOMM channel 1
-sudo rfcomm bind /dev/rfcomm0 $DEVICE_MAC 1
-
-echo "✅ Bound Meshtastic at /dev/rfcomm0"
+echo "✅  Node paired and bound.  /dev/rfcomm0 is ready."

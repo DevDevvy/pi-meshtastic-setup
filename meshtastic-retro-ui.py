@@ -1,113 +1,212 @@
 #!/usr/bin/env python3
-import curses
-import json
-import sqlite3
-from meshtastic.ble_interface import BLEInterface
-from pubsub import pub
-import threading
+"""
+Retro Meshtastic Badge – 3.5″ Touch, Headless Edition
+ • Runs in a plain terminal (curses)
+ • Connects to /dev/rfcomm0 via Meshtastic‑Python
+ • Scroll with finger (drag) or mouse‑wheel or ↑/↓/PgUp/PgDn
+ • Press S → type message → Enter to send
+ • Ctrl‑C (or Q) to quit gracefully
+ • Persists all traffic to ~/.retrobadge/meshtastic.db  (SQLite)
+"""
 
-# --- CONFIG ---
-LOG_JSON = True                   # append raw JSON to log file
-LOG_SQLITE = True                 # insert messages into SQLite
-LOG_FILE = "/home/rangerdan/meshtastic.log"
-DB_FILE  = "/home/rangerdan/meshtastic.db"
-DEV_PATH = "/dev/rfcomm0"
-NODE_ADDR = "48:CA:43:3C:51:FD"  # replace with your node's BLE address
+###############################################################################
+# Imports & constants
+###############################################################################
+import os, json, sqlite3, signal, queue, threading, time, curses
+from pathlib import Path
+from datetime import datetime
 
-# --- SETUP LOGGING ---
-if LOG_JSON:
-    json_fh = open(LOG_FILE, "a", encoding="utf-8")
+import meshtastic.serial_interface  as mserial   # pip install meshtastic
+from pubsub import pub                           # pip install pubsub
 
-if LOG_SQLITE:
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
+DEV_PATH  = "/dev/rfcomm0"                       # override via MESHTASTIC_DEV
+DEV_PATH  = os.getenv("MESHTASTIC_DEV", DEV_PATH)
+
+DATA_DIR  = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
+DB_FILE   = DATA_DIR / "meshtastic.db"
+LOG_FILE  = DATA_DIR / "meshtastic.log"
+
+THEME_FG, THEME_BG = curses.COLOR_GREEN, curses.COLOR_BLACK
+MAX_LEN, PAD_V     = 240, 2                      # chars shown, padding rows
+
+###############################################################################
+# Persistence
+###############################################################################
+json_fh = open(LOG_FILE, "a", encoding="utf‑8", buffering=1)
+db      = sqlite3.connect(DB_FILE, check_same_thread=False)
+with db:
+    db.execute("""
       CREATE TABLE IF NOT EXISTS messages (
         ts   REAL,
         src  TEXT,
-        text TEXT
-      )
-    """)
-    conn.commit()
+        txt  TEXT
+      )""")
 
-# --- MESHTASTIC CALLBACK ---
-messages = []
-def on_receive(packet, interface):
-    js = packet.get("decoded", {})
-    text = js.get("text")
-    src  = packet.get("from", {}).get("userAlias", "unknown")
-    if text:
-        ts = packet.get("timestamp", 0)/1000
-        messages.append((src, text))
-        if LOG_JSON:
-            json_fh.write(json.dumps(packet) + "\n")
-        if LOG_SQLITE:
-            conn.execute(
-              "INSERT INTO messages VALUES (?, ?, ?)",
-              (ts, src, text)
-            )
-            conn.commit()
+###############################################################################
+# Thread‑safe state
+###############################################################################
+incoming_q  = queue.Queue(1024)
+outgoing_q  = queue.Queue(256)
+link_up_evt = threading.Event()
+stop_evt    = threading.Event()
+_iface_lock = threading.Lock()
+_iface      = None
 
-# --- UI ---
-def run_ui(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+###############################################################################
+# PubSub callbacks  (Meshtastic‑Python ≥ 2.7.x)
+###############################################################################
+def _pkt_text(pkt, _iface):
+    """Store & queue every text message."""
+    ts  = getattr(pkt, "rxTime", pkt.get("timestamp", time.time()))
+    if ts > 1e12: ts /= 1000
+    src = getattr(pkt, "fromId", pkt.get("from", {}).get("userAlias", "unknown"))
+    txt = (pkt.decoded.text if hasattr(pkt, "decoded") else
+           pkt["decoded"]["text"])[:MAX_LEN]
 
-    # Colors: green on black for retro feel
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    json_fh.write(json.dumps(pkt, default=str) + "\n")
+    with db: db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, txt))
+    incoming_q.put((ts, src, txt))
 
-    iface = BLEInterface(address=NODE_ADDR)
-    pub.subscribe(on_receive, "meshtastic.receive")
-    threading.Thread(target=iface.loop_forever, daemon=True).start()
+pub.subscribe(_pkt_text,        "meshtastic.receive.text")
+pub.subscribe(lambda _: link_up_evt.set(),   "meshtastic.connection.established")
+pub.subscribe(lambda _: link_up_evt.clear(), "meshtastic.connection.lost")
 
-    offset = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-
-        # Header & Footer
-        stdscr.attron(curses.color_pair(1))
-        stdscr.addstr(0, 0, "╔" + ("═"*(w-2)) + "╗")
-        stdscr.addstr(1, 0, "║ RetroMeshtastic Badge — Touch or ↑/↓ to scroll ║".ljust(w-1) + "║")
-        stdscr.addstr(h-2, 0, "╚" + ("═"*(w-2)) + "╝")
-        stdscr.addstr(h-1, 0, "Press 's' to send | Ctrl-C to exit".ljust(w-1))
-        stdscr.attroff(curses.color_pair(1))
-
-        # Message window inside box
-        for i in range(min(len(messages)-offset, h-4)):
-            src, txt = messages[offset+i]
-            line = f"{src[:10]}: {txt}"
-            stdscr.addstr(2+i, 1, line[:w-2], curses.color_pair(1))
-
-        stdscr.refresh()
-        curses.napms(50)
-
-        # Input handling
+###############################################################################
+# Radio I/O thread
+###############################################################################
+def _radio():
+    global _iface
+    while not stop_evt.is_set():
         try:
-            ch = stdscr.getch()
-        except curses.error:
+            iface = mserial.SerialInterface(devPath=DEV_PATH)
+            if not iface.waitForConfig():
+                raise RuntimeError("Node config timeout")
+            with _iface_lock: _iface = iface
+
+            while not stop_evt.wait(0.1):
+                try:
+                    msg = outgoing_q.get_nowait()
+                    iface.sendText(msg)
+                except queue.Empty:
+                    pass
+
+        except Exception as e:
+            json_fh.write(f"# radio error: {e}\n")
+            link_up_evt.clear()
+            time.sleep(2)
+
+        finally:
+            with _iface_lock:
+                if _iface:
+                    try: _iface.close()
+                    except: pass
+                _iface = None
+
+###############################################################################
+# Helpers
+###############################################################################
+def _fmt(ts):          return datetime.fromtimestamp(ts).strftime("%H:%M")
+def _history(limit=2000):
+    cur = db.cursor()
+    cur.execute("SELECT ts, src, txt FROM messages ORDER BY ts DESC LIMIT ?", (limit,))
+    return list(reversed(cur.fetchall()))
+
+###############################################################################
+# Curses UI
+###############################################################################
+def _ui(stdscr):
+    curses.curs_set(0)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.start_color(); curses.use_default_colors()
+    curses.init_pair(1, THEME_FG, THEME_BG)
+    colour = curses.color_pair(1)
+
+    msgs      = _history()
+    viewofs   = max(0, len(msgs) - (curses.LINES - PAD_V*2))
+    send_mode = False; inp = ""
+
+    HEADER = "╔═ Retro‑Badge — Meshtastic ═╗"
+    FOOTER = "[S]end  [Q]uit  ↑/↓ PgUp/PgDn Touch scroll"
+
+    while not stop_evt.is_set():
+        # drain new packets
+        try:
+            while True: msgs.append(incoming_q.get_nowait())
+        except queue.Empty:
+            pass
+
+        h, w   = stdscr.getmaxyx()
+        pane_h = h - PAD_V*2
+        if viewofs >= max(0, len(msgs) - pane_h):
+            viewofs = max(0, len(msgs) - pane_h)
+
+        stdscr.erase()
+        link = "[● LINK]" if link_up_evt.is_set() else "[○ NO LINK]"
+        stdscr.addstr(0, 0, f"{HEADER} {link}".ljust(w)[:w], colour)
+
+        # message list
+        for i in range(pane_h):
+            j = viewofs + i
+            if j >= len(msgs): break
+            ts, src, txt = msgs[j]
+            pre   = f"{_fmt(ts)} {src[:10]:>10} │ "
+            avail = w - len(pre)
+            stdscr.addstr(PAD_V+i, 0, (pre + txt[:avail]).ljust(w)[:w], colour)
+
+        # footer or prompt
+        if send_mode:
+            prompt = f"Send> {inp}"
+            stdscr.addstr(h-1, 0, prompt.ljust(w)[:w], colour)
+            stdscr.move(h-1, min(len(prompt), w-1))
+        else:
+            stdscr.addstr(h-1, 0, FOOTER.ljust(w)[:w], colour)
+
+        stdscr.refresh(); curses.napms(30)
+
+        try: ch = stdscr.getch()
+        except curses.error: continue
+
+        # ===== send prompt =====
+        if send_mode:
+            if ch in (10, 13):
+                text = inp.strip(); inp = ""; send_mode = False
+                if text:
+                    ts = time.time()
+                    with db: db.execute("INSERT INTO messages VALUES (?,?,?)",
+                                        (ts, "You", text))
+                    msgs.append((ts, "You", text))
+                    outgoing_q.put(text)
+            elif ch in (27,):          send_mode = False
+            elif ch in (127, 8):       inp = inp[:-1]
+            elif 32 <= ch <= 126:      inp += chr(ch)
             continue
 
-        if ch == curses.KEY_UP:
-            offset = max(0, offset-1)
-        elif ch == curses.KEY_DOWN:
-            offset = min(max(0, len(messages)-(h-4)), offset+1)
+        # ===== view mode =====
+        if ch == curses.KEY_UP:            viewofs = max(0, viewofs-1)
+        elif ch == curses.KEY_DOWN:        viewofs = min(len(msgs)-pane_h, viewofs+1)
+        elif ch == curses.KEY_PPAGE:       viewofs = max(0, viewofs-pane_h)
+        elif ch == curses.KEY_NPAGE:       viewofs = min(len(msgs)-pane_h, viewofs+pane_h)
         elif ch == curses.KEY_MOUSE:
-            _, mx, my, _, _ = curses.getmouse()
-            if my < h//2:
-                offset = max(0, offset-1)
-            else:
-                offset = min(max(0, len(messages)-(h-4)), offset+1)
-        elif ch in (ord('s'), ord('S')):
-            curses.echo()
-            stdscr.addstr(h-1, 0, "Send: ".ljust(w-1))
-            txt = stdscr.getstr(h-1, 6, w-8).decode()
-            curses.noecho()
-            if txt:
-                iface.sendText(txt)
-                messages.append(("You", txt))
+            _, mx, my, _, b = curses.getmouse()
+            if b & curses.BUTTON4_PRESSED: viewofs = max(0, viewofs-3)
+            if b & curses.BUTTON5_PRESSED: viewofs = min(len(msgs)-pane_h, viewofs+3)
+            if b & curses.BUTTON1_PRESSED: drag = my
+            if b & curses.BUTTON1_RELEASED:
+                viewofs = max(0, min(len(msgs)-pane_h, viewofs - (my-drag)))
+        elif ch in (ord('s'), ord('S')):   send_mode, inp = True, ""
+        elif ch in (ord('q'), ord('Q')):   stop_evt.set()
 
-if __name__ == "__main__":
-    curses.wrapper(run_ui)
+###############################################################################
+# Entrypoint
+###############################################################################
+def _sig(*_): stop_evt.set()
+
+def main():
+    signal.signal(signal.SIGINT,  _sig)
+    signal.signal(signal.SIGTERM, _sig)
+    threading.Thread(target=_radio, daemon=True).start()
+    curses.wrapper(_ui)
+    stop_evt.set()
+    json_fh.close(); db.close()
+
+if __name__ == "__main__": main()

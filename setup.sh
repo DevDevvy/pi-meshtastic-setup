@@ -1,72 +1,77 @@
-#!/bin/bash
-set -e
-USER="change_me"
-PROJECT_DIR="/home/$USER/meshtastic-badge"
-# sanity‑check
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root (sudo)"; exit 1
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------
+# Initial provisioning script for the Meshtastic Retro Badge on a Pi.
+# * Run ONCE with sudo
+# * Creates Python venv, installs deps, sets up systemd unit
+# ----------------------------------------------------------------------
+set -euo pipefail
+
+# ── Who is the “real” user (the one who invoked sudo)? ────────────────
+REAL_USER="${SUDO_USER:-}"
+if [[ -z "$REAL_USER" ]]; then
+  echo "❌  Run this script with sudo, e.g.  sudo ./setup.sh"
+  exit 1
 fi
 
-echo "🔧 1. Updating system..."
+PROJECT_DIR="/home/$REAL_USER/pi-meshtastic-setup"
+VENV_DIR="$PROJECT_DIR/venv"
+SERVICE_FILE="/etc/systemd/system/meshtastic-badge.service"
+
+echo "🔧 1/7  Updating system…"
 apt update && apt full-upgrade -y
 
-echo "🔧 2. Enable SPI, I2C (touch), and Bluetooth..."
+echo "🔧 2/7  Enabling SPI, I2C & Bluetooth…"
 raspi-config nonint do_spi 0
 raspi-config nonint do_i2c 0
 rfkill unblock bluetooth
 systemctl enable bluetooth
-systemctl start bluetooth
+systemctl start  bluetooth
 
-echo "🔧 3. Add user $USER to bluetooth and dialout groups..."
-usermod -aG bluetooth,dialout $USER
+echo "🔧 3/7  Adding $REAL_USER to bluetooth & dialout groups…"
+usermod -aG bluetooth,dialout "$REAL_USER"
 
-echo "📦 4. Install system dependencies..."
+echo "📦 4/7  Installing system dependencies…"
 apt install -y \
-  python3 python3-venv python3-pip \
-  git libffi-dev libbluetooth-dev \
-  python3-pygame python3-pil python3-evdev \
-  bluez bluez-tools dbus-user-session \
-  iw tcpdump libcap2-bin net-tools \
-  fonts-dejavu unzip curl
+    python3 python3-venv python3-pip \
+    git libffi-dev libbluetooth-dev \
+    bluez bluez-tools rfkill \
+    unzip curl
 
-echo "📁 5. Create project directory at $PROJECT_DIR..."
-mkdir -p "$PROJECT_DIR"/{logs,cache,assets}
+echo "📁 5/7  Creating project directory $PROJECT_DIR…"
+mkdir -p "$PROJECT_DIR"/{logs,assets}
+chown -R "$REAL_USER":"$REAL_USER" "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 
-echo "🐍 6. Set up Python virtual environment..."
-python3 -m venv venv
-source venv/bin/activate
-
-echo "⬆️ 7. Upgrade pip & install Python packages..."
+echo "🐍 6/7  Creating Python venv & installing packages…"
+python3 -m venv "$VENV_DIR"
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install meshtastic[ble] bleak pybluez scapy
+pip install meshtastic[ble] pubsub
 
-echo "🎨 8. Download retro pixel font..."
-curl -L -o assets/pixel_font.ttf \
-  https://github.com/adamyg/fonts/raw/master/bitwise/bitwise.ttf
-
-echo "🛠️ 9. Install meshtastic-badge service..."
-cat <<EOF | tee /etc/systemd/system/meshtastic-badge.service
+echo "🛠️  7/7  Creating systemd service meshtastic-badge…"
+cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=Meshtastic Badge Display
+Description=Meshtastic Retro Badge (curses UI)
 After=bluetooth.target network.target
+StartLimitIntervalSec=0
 
 [Service]
-ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/meshtastic-retro-ui.py
+Type=simple
+User=$REAL_USER
 WorkingDirectory=$PROJECT_DIR
+ExecStart=$PROJECT_DIR/run_badge.sh
 Restart=always
-StandardOutput=journal
-StandardError=journal
-User=$USER
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+chmod 644 "$SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable meshtastic-badge
 
-echo "✅ Setup complete!"
-echo "   • Place your main.py in $PROJECT_DIR"
-echo "   • Touchscreen drivers must already be installed"
-echo "   • Reboot to start the badge UI: sudo reboot"
+echo "✅  Setup complete."
+echo "• OPTIONAL: pair your radio now → sudo ./pair-meshtastic.sh AA:BB:CC:DD:EE:FF"
+echo "• Reboot to launch badge automatically:  sudo reboot"
