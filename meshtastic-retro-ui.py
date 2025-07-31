@@ -2,7 +2,7 @@
 """
 meshtastic-retro-ui.py
 
-Retro Meshtastic Badge – 3.5″ Touch, Headless Edition
+Retro Meshtastic Badge – 3.5” Touch, Headless Edition
 • Full-width title bar with link status in color
 • Scrollable, wrapped message list
 • Send mode (S → type → Enter)
@@ -13,13 +13,12 @@ import os, json, sqlite3, signal, queue, threading, time, curses, textwrap
 from pathlib import Path
 from datetime import datetime
 from meshtastic.ble_interface import BLEInterface
-from pubsub import pub
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
-NODE_ADDR = "48:CA:43:3C:51:FD"          # change to your node's BLE MAC
+NODE_ADDR = os.getenv("MESHTASTIC_BLE_ADDR", "48:CA:43:3C:51:FD")  # change to your node's BLE MAC
 MAX_LEN, PAD_V = 240, 2  # truncate length, vertical padding
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────────
@@ -41,74 +40,74 @@ stop_evt    = threading.Event()
 _iface_lock = threading.Lock()
 _iface      = None
 
-# ── PubSub callbacks ─────────────────────────────────────────────────────────
-def _handle_text(pkt):
-    """pkt is a dict from meshtastic.receive.text"""
-    ts  = getattr(pkt, "rxTime", pkt.get("timestamp", time.time()))
+# ── BLE CALLBACKS ────────────────────────────────────────────────────────────
+def on_receive(packet, interface):
+    """Called on every incoming Meshtastic packet over BLE."""
+    try:
+        text = packet['decoded']['text']
+        src  = packet.get('from', {}).get('userAlias', 'unknown')
+    except Exception:
+        return
+    ts = getattr(packet, 'rxTime', time.time())
     if ts > 1e12: ts /= 1000
-    src = getattr(pkt, "fromId", pkt.get("from", {}).get("userAlias", "unknown"))
-    txt = (pkt.decoded.text if hasattr(pkt, "decoded") else pkt["decoded"]["text"])[:MAX_LEN]
-    json_fh.write(json.dumps(pkt, default=str) + "\n")
+    # log and persist
+    json_fh.write(json.dumps(packet, default=str) + "\n")
     with db:
-        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, txt))
-    incoming_q.put((ts, src, txt))
+        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+    incoming_q.put((ts, src, text))
 
-# subscribe with matching signatures:
-pub.subscribe(_handle_text,                      "meshtastic.receive.text")
-pub.subscribe(lambda: link_up_evt.set(),         "meshtastic.connection.established")
-pub.subscribe(lambda: link_up_evt.clear(),       "meshtastic.connection.lost")
+
+def on_connection_established(interface):
+    """BLE link up"""
+    link_up_evt.set()
+    json_fh.write(f"# LINK UP to {interface.address}\n")
+
+
+def on_connection_lost(interface):
+    """BLE link lost"""
+    link_up_evt.clear()
+    json_fh.write(f"# LINK DOWN from {interface.address}\n")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 def _find_ble_node():
     json_fh.write("# Scanning for BLE devices…\n")
-    devices = BLEInterface.scan()  # filters Meshtastic UUID 
+    devices = BLEInterface.scan()
     json_fh.write(f"# Found {len(devices)} BLE devices.\n")
     for d in devices:
         json_fh.write(f"#   • {d.name} @ {d.address}\n")
     return devices[0].address if devices else None
 
+
 def _radio_worker():
     global _iface
     addr = NODE_ADDR or _find_ble_node()
-    while not stop_evt.is_set():
-        try:
-            json_fh.write(f"# Attempting BLE connection to: {addr}\n")
-            iface = BLEInterface(address=addr, debugOut=json_fh)
-            iface.waitForConfig()  # blocks until node DB downloaded 
-            with _iface_lock:
-                _iface = iface
+    # instantiate and assign callbacks
+    iface = BLEInterface(address=addr, debugOut=json_fh)
+    iface.onReceive               = on_receive
+    iface.onConnectionEstablished = on_connection_established
+    iface.onConnectionLost        = on_connection_lost
+    # sender thread: flush outgoing_q
+    def _sender():
+        while not stop_evt.wait(0.1):
+            try:
+                msg = outgoing_q.get_nowait()
+                iface.sendText(msg)
+            except queue.Empty:
+                pass
+    threading.Thread(target=_sender, daemon=True).start()
+    # run BLE event loop (handles reconnects internally)
+    iface.loop_forever()
 
-            json_fh.write("# BLE link is up, entering main loop.\n")
-            while not stop_evt.wait(0.1):
-                try:
-                    msg = outgoing_q.get_nowait()
-                    iface.sendText(msg)
-                except queue.Empty:
-                    pass
-
-        except Exception as e:
-            json_fh.write(f"# Radio error: {e}\n")
-            link_up_evt.clear()
-            with _iface_lock:
-                if _iface:
-                    try: _iface.close()
-                    except: pass
-                    _iface = None
-
-            new_addr = _find_ble_node()
-            if new_addr and new_addr != addr:
-                addr = new_addr
-                json_fh.write(f"# Switching to BLE address: {addr}\n")
-            time.sleep(5)
-
-# ── HELPERS ─────────────────────────────────────────────────────────────────
+# ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M")
+
 
 def _history(limit=2000):
     cur = db.cursor()
     cur.execute("SELECT ts, src, txt FROM messages ORDER BY ts DESC LIMIT ?", (limit,))
     return list(reversed(cur.fetchall()))
+
 
 def safe_footer(win, row: int, text: str, attr=0):
     h, w = win.getmaxyx()
@@ -124,9 +123,9 @@ def _ui(stdscr):
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)  # text
-    curses.init_pair(2, curses.COLOR_RED,   curses.COLOR_BLACK)  # NO LINK
-    curses.init_pair(3, curses.COLOR_BLUE,  curses.COLOR_BLACK)  # LINK
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED,   curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_BLUE,  curses.COLOR_BLACK)
 
     text_col = curses.color_pair(1)
     no_link  = curses.color_pair(2)
@@ -140,7 +139,7 @@ def _ui(stdscr):
     TITLE = " Retro-Meshtastic Badge — Touch or ↑/↓ to scroll "
 
     while not stop_evt.is_set():
-        # Drain new messages
+        # drain incoming messages
         try:
             while True:
                 msgs.append(incoming_q.get_nowait())
@@ -157,10 +156,8 @@ def _ui(stdscr):
         status = "[● LINKED]" if link_up_evt.is_set() else "[○ NO LINK]"
         safe_footer(stdscr, 1, status.center(w-1), yes_link if link_up_evt.is_set() else no_link)
 
-        # Render wrapped history
-        row = PAD_V + 2
-        used = 0
-        idx = viewofs
+        # render wrapped history
+        row, used, idx = PAD_V + 2, 0, viewofs
         while used < pane_h and idx < len(msgs):
             ts, src, txt = msgs[idx]
             prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
@@ -193,24 +190,24 @@ def _ui(stdscr):
             continue
 
         if send_mode:
-            if c in (10, 13):
+            if c in (10, 13):  # Enter
                 msg = inp.strip()
-                send_mode = False
-                inp = ""
+                send_mode, inp = False, ""
                 if msg:
                     ts = time.time()
                     with db:
                         db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", msg))
                     msgs.append((ts, "You", msg))
                     outgoing_q.put(msg)
-            elif c in (27,):
+            elif c in (27,):    # Esc
                 send_mode = False
-            elif c in (127, 8):
+            elif c in (127, 8): # Backspace
                 inp = inp[:-1]
             elif 32 <= c <= 126:
                 inp += chr(c)
             continue
 
+        # navigation keys
         if c == curses.KEY_UP:
             viewofs = max(0, viewofs - 1)
         elif c == curses.KEY_DOWN:
@@ -226,13 +223,14 @@ def _ui(stdscr):
             if b & curses.BUTTON5_PRESSED:
                 viewofs = min(len(msgs)-pane_h, viewofs + 3)
         elif c in (ord('s'), ord('S')):
-            send_mode = True; inp = ""
+            send_mode, inp = True, ""
         elif c in (ord('q'), ord('Q')):
             stop_evt.set()
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
     stop_evt.set()
+
 
 def main():
     signal.signal(signal.SIGINT,  _sig)
@@ -242,6 +240,7 @@ def main():
     stop_evt.set()
     json_fh.close()
     db.close()
+
 
 if __name__ == "__main__":
     main()
