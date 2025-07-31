@@ -19,8 +19,7 @@ from pubsub import pub
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
-NODE_ADDR = os.getenv("MESHTASTIC_BLE_ADDR", None)  # e.g. "48:CA:43:3C:51:FD"
-
+NODE_ADDR = "48:CA:43:3C:51:FD"          # change to your node's BLE MAC
 MAX_LEN, PAD_V = 240, 2  # truncate length, vertical padding
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────────
