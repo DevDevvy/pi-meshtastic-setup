@@ -8,6 +8,7 @@
 set -euo pipefail
 MAC="48:CA:43:3C:51:FD"           # ← edit to your node’s MAC
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bash $PROJECT_DIR/pair-meshtastic.sh $MAC
 VENV="$PROJECT_DIR/venv"
 UI="$PROJECT_DIR/meshtastic-retro-ui.py"
 
