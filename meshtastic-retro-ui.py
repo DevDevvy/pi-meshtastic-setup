@@ -16,7 +16,7 @@ from datetime import datetime
 import getpass
 import sys
 
-import meshtastic.serial_interface as mserial     # from venv
+from meshtastic.ble_interface import BLEInterface     # from venv
 from pubsub import pub                            # from venv
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
@@ -25,6 +25,7 @@ BAUD     = int(os.getenv("MESHTASTIC_BAUD", "921600"))  # Add this line
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
+NODE_ADDR = "11:22:33:44:55:66"  # Replace with your node's BLE address
 
 MAX_LEN, PAD_V = 240, 2            # msg truncate, vertical padding
 
@@ -69,7 +70,7 @@ def _radio_worker():
         try:
             # Log connection attempt
             json_fh.write(f"# Trying {DEV_PATH} at {BAUD} baud\n")
-            iface = mserial.SerialInterface(devPath=DEV_PATH, baud=BAUD)  # Add baud param
+            iface = BLEInterface(address=NODE_ADDR)  # <-- fix here
             if not iface.waitForConfig():
                 raise RuntimeError("Node config timeout")
             with _iface_lock:
