@@ -27,7 +27,4 @@ rfcomm bind /dev/rfcomm0 "$MAC" 1 || {
 
 echo "✅  Node paired and bound.  /dev/rfcomm0 is ready."
 
-meshtastic --port /dev/rfcomm0 --set serial.enabled  true
-meshtastic --port /dev/rfcomm0 --set serial.mode     PROTO
-meshtastic --port /dev/rfcomm0 --set serial.baud     BAUD_115200
-meshtastic --port /dev/rfcomm0 --reboot
+

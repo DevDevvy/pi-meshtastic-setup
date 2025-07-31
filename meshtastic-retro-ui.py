@@ -13,12 +13,15 @@ Retro Meshtastic Badge – 3.5″ Touch, Headless Edition
 import os, json, sqlite3, signal, queue, threading, time, curses
 from pathlib import Path
 from datetime import datetime
+import getpass
+import sys
 
 import meshtastic.serial_interface as mserial     # from venv
 from pubsub import pub                            # from venv
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DEV_PATH = os.getenv("MESHTASTIC_DEV", "/dev/rfcomm0")
+BAUD     = int(os.getenv("MESHTASTIC_BAUD", "921600"))  # Add this line
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
@@ -64,7 +67,9 @@ def _radio_worker():
     global _iface
     while not stop_evt.is_set():
         try:
-            iface = mserial.SerialInterface(devPath=DEV_PATH)
+            # Log connection attempt
+            json_fh.write(f"# Trying {DEV_PATH} at {BAUD} baud\n")
+            iface = mserial.SerialInterface(devPath=DEV_PATH, baud=BAUD)  # Add baud param
             if not iface.waitForConfig():
                 raise RuntimeError("Node config timeout")
             with _iface_lock:
@@ -237,6 +242,16 @@ def _ui(stdscr):
 def _sig(*_): stop_evt.set()
 
 def main():
+    # Diagnostics
+    json_fh.write(f"# Running as user: {getpass.getuser()}\n")
+    json_fh.write(f"# Python executable: {sys.executable}\n")
+    json_fh.write(f"# Checking /dev/rfcomm0 permissions...\n")
+    try:
+        st = os.stat(DEV_PATH)
+        json_fh.write(f"# /dev/rfcomm0 mode: {oct(st.st_mode)} owner: {st.st_uid} group: {st.st_gid}\n")
+    except Exception as e:
+        json_fh.write(f"# Could not stat /dev/rfcomm0: {e}\n")
+
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
     threading.Thread(target=_radio_worker, daemon=True).start()
