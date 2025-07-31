@@ -13,6 +13,7 @@ import os, json, sqlite3, signal, queue, threading, time, curses
 from pathlib import Path
 from datetime import datetime
 import getpass, sys
+import textwrap
 
 from meshtastic.ble_interface import BLEInterface
 from pubsub import pub
@@ -178,15 +179,25 @@ def _ui(stdscr):
         safe_footer(stdscr, 1, status.center(w-1), status_attr)
 
         # ── Messages start at row 2 ─────────────────────────────────
-        for i in range(pane_h):
-            idx = viewofs + i
-            if idx >= len(msgs):
-                break
+        row = PAD_V + 2
+        lines_used = 0
+        i = 0
+        idx = viewofs
+        while lines_used < pane_h and idx < len(msgs):
             ts, src, txt = msgs[idx]
             prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
             avail  = w - len(prefix)
-            line   = (prefix + txt[:avail]).ljust(w)[:w]
-            stdscr.addstr(PAD_V + 2 + i, 0, line, text_col)
+            wrapped_lines = textwrap.wrap(txt, width=avail) or [""]
+            for j, line in enumerate(wrapped_lines):
+                if lines_used >= pane_h:
+                    break
+                if j == 0:
+                    display_line = (prefix + line).ljust(w)[:w]
+                else:
+                    display_line = (" " * len(prefix) + line).ljust(w)[:w]
+                stdscr.addstr(row + lines_used, 0, display_line, text_col)
+                lines_used += 1
+            idx += 1
 
         # ── Footer (rows h-2 & h-1) ────────────────────────────────
         stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝", text_col)
