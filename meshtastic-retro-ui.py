@@ -16,7 +16,7 @@ from datetime import datetime
 import getpass
 import sys
 
-from meshtastic.ble_interface import BLEInterface     # from venv
+from meshtastic.ble_interface import BLEInterface, BLEScanner  # from venv
 from pubsub import pub                            # from venv
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ BAUD     = int(os.getenv("MESHTASTIC_BAUD", "921600"))  # Add this line
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
-NODE_ADDR = "11:22:33:44:55:66"  # Replace with your node's BLE address
+NODE_ADDR = os.getenv("MESHTASTIC_BLE_ADDR", "48:CA:43:3C:51:FD")  # Set your node's BLE address or use env var
 
 MAX_LEN, PAD_V = 240, 2            # msg truncate, vertical padding
 
@@ -64,14 +64,28 @@ pub.subscribe(lambda _: link_up_evt.set(),   "meshtastic.connection.established"
 pub.subscribe(lambda _: link_up_evt.clear(), "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
+def _find_ble_node():
+    """Scan for a Meshtastic node and return its BLE address."""
+    json_fh.write("# Scanning for BLE Meshtastic nodes...\n")
+    scanner = BLEScanner()
+    found = scanner.scan(timeout=10)
+    for dev in found:
+        # Try to match by name or service UUID
+        if "Meshtastic" in dev.name or dev.name.startswith("MT-"):
+            json_fh.write(f"# Found Meshtastic node: {dev.address} ({dev.name})\n")
+            return dev.address
+    json_fh.write("# No Meshtastic BLE node found during scan.\n")
+    return None
+
 def _radio_worker():
     global _iface
+    addr = NODE_ADDR
     while not stop_evt.is_set():
         try:
             # Log connection attempt
-            json_fh.write(f"# Trying {DEV_PATH} at {BAUD} baud\n")
-            iface = BLEInterface(address=NODE_ADDR)  # <-- fix here
-            if not iface.waitForConfig():
+            json_fh.write(f"# Trying BLE address: {addr}\n")
+            iface = BLEInterface(address=addr)
+            if not iface.waitForConfig(timeout=15):
                 raise RuntimeError("Node config timeout")
             with _iface_lock:
                 _iface = iface
@@ -87,7 +101,12 @@ def _radio_worker():
         except Exception as e:
             json_fh.write(f"# radio error: {e}\n")
             link_up_evt.clear()
-            time.sleep(2)
+            # Try scanning for node if connection failed
+            scan_addr = _find_ble_node()
+            if scan_addr and scan_addr != addr:
+                addr = scan_addr
+                json_fh.write(f"# Switching to found BLE address: {addr}\n")
+            time.sleep(5)
         finally:
             with _iface_lock:
                 if _iface:

@@ -21,6 +21,9 @@ echo "🔧 Bringing up BLE adapter (hci0)…"
 sudo rfkill unblock bluetooth
 hciconfig hci0 up || true
 
+echo "🔎 MESHTASTIC_BLE_ADDR: ${MESHTASTIC_BLE_ADDR:-not set}"
+# Reminder: export MESHTASTIC_BLE_ADDR=11:22:33:44:55:66 (your node's BLE MAC)
+
 # Activate venv & launch UI
 # shellcheck disable=SC1090
 source "$VENV/bin/activate"
