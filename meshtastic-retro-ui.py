@@ -325,6 +325,9 @@ def _ui(stdscr):
         except curses.error:
             continue
 
+        if stop_evt.is_set():
+            break  # Exit UI loop immediately if stop event is set
+
         if send_mode:
             if c in (10, 13):  # Enter
                 msg = inp.strip()
@@ -362,10 +365,18 @@ def _ui(stdscr):
             send_mode, inp = True, ""
         elif c in (ord('q'), ord('Q')):
             stop_evt.set()
+            break  # Exit UI loop immediately on Q
+
+    # Ensure terminal is restored on exit
+    curses.endwin()
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
     stop_evt.set()
+    try:
+        curses.endwin()
+    except Exception:
+        pass
 
 
 def main():
