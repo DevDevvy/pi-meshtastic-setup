@@ -46,56 +46,56 @@ last_connection_attempt = 0
 
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
 def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
+    json_fh.write(f"# PACKET: topic={topic} packet={packet}\n")
     try:
         txt_field = None
 
         # 1. packets delivered as dicts
         if isinstance(packet, dict):
             dec = packet.get("decoded", {})
-            txt_field = dec.get("text") \
-                      or dec.get("data", {}).get("text")
+            # easiest cases first
+            txt_field = dec.get("text") or dec.get("data", {}).get("text")
 
-            # fallback for new-style data.payload (bytes)
+            # new‑style: data.payload -> bytes list
             if txt_field is None and dec.get("data", {}).get("payload"):
                 try:
-                    txt_field = bytes(dec["data"]["payload"]).decode("utf‑8")
+                    pl = dec["data"]["payload"]
+                    txt_field = (bytes(pl) if isinstance(pl, list) else pl).decode("utf‑8", "ignore")
                 except Exception:
                     pass
 
             src = packet.get("fromId", "unknown")
             ts  = packet.get("rxTime", time.time())
 
-        # 2. packets delivered as objects
-        else:
+        else:                                      # packet as object
             dec = getattr(packet, "decoded", None)
             if dec:
                 txt_field = getattr(dec, "text", None)
 
-                if txt_field is None and hasattr(dec, "data"):
-                    # old firmware: decoded.data.text
-                    txt_field = getattr(dec.data, "text", None)
-
-                    # new firmware: decoded.data.payload -> bytes
-                    if txt_field is None and hasattr(dec.data, "payload"):
+                data = getattr(dec, "data", None)
+                if txt_field is None and data:
+                    txt_field = getattr(data, "text", None)
+                    if txt_field is None and hasattr(data, "payload"):
                         try:
-                            txt_field = bytes(dec.data.payload).decode("utf‑8")
+                            txt_field = bytes(data.payload).decode("utf‑8", "ignore")
                         except Exception:
                             pass
 
             src = getattr(packet, "fromId", "unknown")
             ts  = getattr(packet, "rxTime", time.time())
+        # ---------- end extraction ----------
 
-        if txt_field:
-            # timestamp sanity
-            if ts > 1e12: ts /= 1000
-            text = txt_field[:MAX_LEN]
+        if not txt_field:
+            return   # not a text packet we care about
 
-            json_fh.write(f"# Received: {src}: {text}\n")
-            with db:
-                db.execute(
-                    "INSERT INTO messages VALUES (?,?,?)", (ts, src, text)
-                )
-            incoming_q.put((ts, src, text))
+        if ts > 1e12:          # ms → s
+            ts /= 1000
+        text = txt_field[:MAX_LEN]
+
+        json_fh.write(f"# Received: {src}: {text}\n")
+        with db:
+            db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+        incoming_q.put((ts, src, text))
     except Exception as e:
         json_fh.write(f"# Message handler error: {e}\n")
 
