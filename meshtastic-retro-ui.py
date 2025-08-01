@@ -46,7 +46,12 @@ last_connection_attempt = 0
 
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
 def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
-    json_fh.write(f"# PACKET: topic={topic} packet={packet}\n")
+    # writeflush helper
+    def log(line):
+        json_fh.write(line + "\n")
+        json_fh.flush()
+
+    log(f"# PACKET: topic={topic} packet={packet}")
     try:
         txt_field = None
 
@@ -92,12 +97,12 @@ def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
             ts /= 1000
         text = txt_field[:MAX_LEN]
 
-        json_fh.write(f"# Received: {src}: {text}\n")
+        log(f"# Received: {src}: {text}")
         with db:
             db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
         incoming_q.put((ts, src, text))
     except Exception as e:
-        json_fh.write(f"# Message handler error: {e}\n")
+        log(f"# Received: {src}: {text}")
 
 def on_conn_established(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     link_up_evt.set()
@@ -109,8 +114,6 @@ def on_conn_lost(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
 
 # ── PUBSUB SUBSCRIPTIONS ─────────────────────────────────────────────────────
 pub.subscribe(simple_message_handler,        "meshtastic.receive")       # catches all receive.* events :contentReference[oaicite:0]{index=0}
-pub.subscribe(simple_message_handler,        "meshtastic.receive.data")  # catches data-channel packets :contentReference[oaicite:1]{index=1}
-pub.subscribe(simple_message_handler,        "meshtastic.receive.text")
 pub.subscribe(on_conn_established,           "meshtastic.connection.established")
 pub.subscribe(on_conn_lost,                  "meshtastic.connection.lost")
 
