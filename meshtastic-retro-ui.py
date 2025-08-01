@@ -164,8 +164,15 @@ def _radio_worker():
                         
                         with _iface_lock:
                             if _iface:
-                                _iface.sendText(msg)
-                                connection_status = "Message sent!"
+                                # Use wantAck=True for reliable delivery
+                                try:
+                                    sent_packet = _iface.sendText(msg, wantAck=True)
+                                    json_fh.write(f"# sendText returned: {sent_packet}\n")
+                                    connection_status = "Message sent!"
+                                except Exception as send_err:
+                                    json_fh.write(f"# sendText error: {send_err}\n")
+                                    connection_status = f"Send error: {send_err}"
+                                    break
                                 
                     except queue.Empty:
                         # No outgoing messages, just keep connection alive
