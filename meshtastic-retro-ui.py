@@ -77,19 +77,36 @@ def _find_ble_node():
 def _radio_worker():
     global _iface, connection_status, last_connection_attempt
     
-    # Try to find the device first
+    # Use the explicit address provided
     addr = NODE_ADDR
     if not addr or addr == "48:CA:43:3C:51:FD":  # Default placeholder
-        json_fh.write("# No specific address set, scanning for devices...\n")
-        connection_status = "Scanning for devices..."
-        addr = _find_ble_node()
-        if not addr:
-            json_fh.write("# No BLE devices found\n")
-            connection_status = "No BLE devices found"
-            return
+        json_fh.write("# No BLE address configured in MESHTASTIC_BLE_ADDR\n")
+        connection_status = "No BLE address configured"
+        return
     
-    json_fh.write(f"# Using BLE address: {addr}\n")
-    connection_status = f"Found device: {addr}"
+    json_fh.write(f"# Using configured BLE address: {addr}\n")
+    
+    # Scan to verify the device exists but don't change the address
+    try:
+        json_fh.write("# Scanning to verify device exists...\n")
+        connection_status = "Verifying device exists..."
+        devices = BLEInterface.scan()
+        device_found = False
+        for d in devices:
+            if d.address.upper() == addr.upper():
+                json_fh.write(f"# Target device found: {d.name} @ {d.address}\n")
+                connection_status = f"Target device found: {d.name}"
+                device_found = True
+                break
+        
+        if not device_found:
+            json_fh.write(f"# Warning: Target device {addr} not found in scan\n")
+            json_fh.write(f"# Found devices: {[f'{d.name}@{d.address}' for d in devices]}\n")
+            connection_status = f"Device {addr} not found in scan, trying anyway..."
+        
+    except Exception as e:
+        json_fh.write(f"# Device verification scan failed: {e}, proceeding anyway\n")
+        connection_status = "Scan failed, proceeding anyway..."
     
     retry_count = 0
     max_retries = 5
@@ -98,13 +115,13 @@ def _radio_worker():
         try:
             last_connection_attempt = time.time()
             connection_status = f"Connecting to {addr}... ({retry_count + 1}/{max_retries})"
-            json_fh.write(f"# Connection attempt {retry_count + 1}: {addr}\n")
+            json_fh.write(f"# Connection attempt {retry_count + 1} to {addr}\n")
             
             # Clear previous state
             link_up_evt.clear()
             
-            # Create interface simply
-            json_fh.write("# Creating BLE interface...\n")
+            # Create interface with the explicit address
+            json_fh.write(f"# Creating BLE interface for {addr}...\n")
             with _iface_lock:
                 _iface = BLEInterface(address=addr, debugOut=json_fh)
                 # Set up simple message handler
@@ -114,7 +131,6 @@ def _radio_worker():
             connection_status = "Testing connection..."
             
             # Test connection by getting node info
-            connection_test_count = 0
             max_test_attempts = 10
             
             for i in range(max_test_attempts):
@@ -193,8 +209,8 @@ def _radio_worker():
                 stop_evt.wait(wait_time)
     
     if retry_count >= max_retries:
-        json_fh.write(f"# Max retries exceeded\n")
-        connection_status = "Max retries exceeded"
+        json_fh.write(f"# Max retries exceeded for {addr}\n")
+        connection_status = f"Max retries exceeded for {addr}"
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
