@@ -150,12 +150,57 @@ def _radio_worker():
             # Clear any previous connection state
             link_up_evt.clear()
             
-            # Create interface in a separate try block to catch connection errors early
+            # Create interface with timeout handling
             json_fh.write("# Creating BLE interface...\n")
             connection_status = "Creating BLE interface..."
             
+            # Use a thread to create the interface with a timeout
+            interface_created = threading.Event()
+            interface_error = [None]  # List to store error from thread
+            
+            def create_interface():
+                try:
+                    json_fh.write(f"# Attempting BLEInterface(address={addr})\n")
+                    new_iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False, noNodes=False)
+                    with _iface_lock:
+                        global _iface
+                        _iface = new_iface
+                    json_fh.write("# BLEInterface created successfully\n")
+                    interface_created.set()
+                except Exception as e:
+                    json_fh.write(f"# BLEInterface creation failed: {e}\n")
+                    import traceback
+                    json_fh.write(f"# Creation traceback: {traceback.format_exc()}\n")
+                    interface_error[0] = e
+                    interface_created.set()
+            
+            # Start the interface creation in a separate thread
+            create_thread = threading.Thread(target=create_interface, daemon=True)
+            create_thread.start()
+            
+            # Wait for interface creation with timeout
+            interface_timeout = 30
+            json_fh.write(f"# Waiting up to {interface_timeout}s for interface creation...\n")
+            
+            for i in range(interface_timeout):
+                if interface_created.wait(timeout=1):
+                    break
+                if stop_evt.is_set():
+                    json_fh.write("# Stop event set during interface creation\n")
+                    break
+                connection_status = f"Creating interface... ({i+1}/{interface_timeout}s)"
+                json_fh.write(f"# Interface creation wait: {i+1}/{interface_timeout}s\n")
+            
+            # Check if interface creation failed
+            if interface_error[0]:
+                raise interface_error[0]
+            
+            if not interface_created.is_set():
+                raise TimeoutError(f"BLE interface creation timed out after {interface_timeout}s")
+            
             with _iface_lock:
-                _iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False, noNodes=False)
+                if not _iface:
+                    raise RuntimeError("BLE interface was not created properly")
             
             json_fh.write("# BLE interface created successfully\n")
             connection_status = "Interface created, handshaking..."
@@ -181,6 +226,7 @@ def _radio_worker():
                 try:
                     with _iface_lock:
                         if _iface:
+                            json_fh.write(f"# Attempting getMyNodeInfo() at {i+1}s...\n")
                             # Try to get my node info as a connection test
                             my_info = _iface.getMyNodeInfo()
                             if my_info and 'user' in my_info:
@@ -189,9 +235,10 @@ def _radio_worker():
                                 link_up_evt.set()
                                 connection_status = "Connected via node info!"
                                 break
+                            else:
+                                json_fh.write(f"# getMyNodeInfo returned: {my_info}\n")
                 except Exception as e:
-                    # This is expected while connecting, don't log as error
-                    pass
+                    json_fh.write(f"# getMyNodeInfo attempt {i+1} failed: {e}\n")
                     
                 time.sleep(1)
             
@@ -208,6 +255,7 @@ def _radio_worker():
                         if _iface:
                             json_fh.write("# Final connection verification attempt...\n")
                             my_info = _iface.getMyNodeInfo()
+                            json_fh.write(f"# Final getMyNodeInfo result: {my_info}\n")
                             if my_info:
                                 user_name = my_info.get('user', {}).get('longName', 'Unknown')
                                 node_id = my_info.get('user', {}).get('id', 'Unknown')

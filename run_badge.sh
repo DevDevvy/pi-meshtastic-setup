@@ -90,9 +90,42 @@ fi
 
 # Test BLE permissions
 echo "🔐 Testing BLE permissions..."
-if ! python -c "from meshtastic.ble_interface import BLEInterface; BLEInterface.scan()" 2>/dev/null; then
+if ! timeout 10s python -c "from meshtastic.ble_interface import BLEInterface; print('BLE scan:', len(BLEInterface.scan())); print('BLE test passed')" 2>/dev/null; then
     echo "⚠️  BLE scan test failed - may need to run as root or fix permissions"
+    echo "Trying to scan manually..."
+    timeout 10s python -c "
+from meshtastic.ble_interface import BLEInterface
+import traceback
+try:
+    devices = BLEInterface.scan()
+    print(f'Found {len(devices)} devices')
+    for d in devices:
+        print(f'  {d.name} @ {d.address}')
+except Exception as e:
+    print(f'Error: {e}')
+    traceback.print_exc()
+" || echo "Manual scan also failed"
 fi
+
+# Test creating a BLE interface (without connecting)
+echo "🧪 Testing BLE interface creation..."
+timeout 15s python -c "
+from meshtastic.ble_interface import BLEInterface
+import traceback
+import time
+try:
+    print('Creating BLE interface...')
+    start_time = time.time()
+    iface = BLEInterface(address='$MESHTASTIC_BLE_ADDR')
+    elapsed = time.time() - start_time
+    print(f'Interface created in {elapsed:.1f}s')
+    print('Closing interface...')
+    iface.close()
+    print('Test passed')
+except Exception as e:
+    print(f'Interface creation failed: {e}')
+    traceback.print_exc()
+" || echo "Interface creation test failed"
 
 echo "📱 Starting UI with BLE address: $MESHTASTIC_BLE_ADDR"
 echo "📝 Logs will be written to: ~/.retrobadge/meshtastic.log"
