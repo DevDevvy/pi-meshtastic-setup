@@ -13,6 +13,7 @@ import os, json, sqlite3, signal, queue, threading, time, curses, textwrap
 from pathlib import Path
 from datetime import datetime
 from meshtastic.ble_interface import BLEInterface
+from pubsub import pub
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
@@ -43,23 +44,33 @@ connection_status = "Initializing..."  # For UI display
 last_connection_attempt = 0
 
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
-def simple_message_handler(packet, interface):
-    """Simple message handler without pubsub"""
+def simple_message_handler(packet):
+    """Called when a text message is received via pubsub."""
     try:
-        # Check if this is a text message
         if hasattr(packet, 'decoded') and hasattr(packet.decoded, 'text'):
             text = packet.decoded.text[:MAX_LEN]
-            from_id = getattr(packet, 'fromId', 'unknown')
-            ts = getattr(packet, 'rxTime', time.time())
-            if ts > 1e12:
-                ts /= 1000
-            
-            json_fh.write(f"# Received: {from_id}: {text}\n")
+            src  = getattr(packet, 'fromId', 'unknown')
+            ts   = getattr(packet, 'rxTime', time.time())
+            if ts > 1e12: ts /= 1000
+            json_fh.write(f"# Received: {src}: {text}\n")
             with db:
-                db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, from_id, text))
-            incoming_q.put((ts, from_id, text))
+                db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+            incoming_q.put((ts, src, text))
     except Exception as e:
         json_fh.write(f"# Message handler error: {e}\n")
+
+def on_conn_established(_):
+    link_up_evt.set()
+    json_fh.write("# CONNECTION ESTABLISHED\n")
+
+def on_conn_lost(_):
+    link_up_evt.clear()
+    json_fh.write("# CONNECTION LOST\n")
+
+# ── PUBSUB SUBSCRIPTIONS ─────────────────────────────────────────────────────
+pub.subscribe(simple_message_handler,        "meshtastic.receive.text")
+pub.subscribe(on_conn_established,           "meshtastic.connection.established")
+pub.subscribe(on_conn_lost,                  "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 def _find_ble_node():
@@ -110,8 +121,6 @@ def _radio_worker():
             json_fh.write(f"# Creating BLE interface for {addr}...\n")
             with _iface_lock:
                 _iface = BLEInterface(address=addr, debugOut=json_fh)
-                # Set up simple message handler
-                _iface.onReceive = simple_message_handler
             
             json_fh.write("# Interface created, testing connection...\n")
             connection_status = "Testing connection..."
@@ -262,26 +271,17 @@ def _ui(stdscr):
         
         # Show detailed connection status
         if link_up_evt.is_set():
-            status = "[● LINKED]"
-            status_attr = yes_link
-        else:
-            status = "[○ NO LINK]"
-            status_attr = no_link
-        
-        # Add detailed status on second line
-        detailed_status = f"Status: {connection_status}"[:w-1]
-        safe_footer(stdscr, 1, status.center(w-1), status_attr)
-        
-        # Add a third line for detailed connection info
-        if h > 10:  # Only if we have enough screen space
-            time_since_attempt = time.time() - last_connection_attempt if last_connection_attempt > 0 else 0
-            debug_info = f"Last attempt: {time_since_attempt:.0f}s ago | {detailed_status}"[:w-1]
-            safe_footer(stdscr, 2, debug_info, warn_col)
-            # Adjust message area to account for extra status line
-            pane_h -= 1
-            row_start = PAD_V + 3
-        else:
+            safe_footer(stdscr, 1, "[● LINKED] Connected to " + NODE_ADDR, yes_link)
             row_start = PAD_V + 2
+        else:
+            safe_footer(stdscr, 1, "[○ NO LINK] " + connection_status[:w-5], no_link)
+            # detailed debug line
+            if h > 10:
+                debug = f"Last attempt: {int(time.time()-last_connection_attempt)}s ago"
+                safe_footer(stdscr, 2, debug[:w-1], warn_col)
+                row_start = PAD_V + 3
+            else:
+                row_start = PAD_V + 2
 
         # render wrapped history
         row, used, idx = row_start, 0, viewofs

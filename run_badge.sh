@@ -83,21 +83,13 @@ if ! python -c "import meshtastic" 2>/dev/null; then
     echo "Please run: pip install meshtastic"
     exit 1
 fi
-
 if ! python -c "import pubsub" 2>/dev/null; then
-    echo "⚠️  pubsub package not found, message receiving may not work"
-    echo "Consider running: pip install pypubsub"
+    echo "❌ pubsub package not found in venv"
+    echo "Please run: pip install pypubsub"
+    exit 1
 fi
 
-# Remove the BLE interface testing that could block the connection
+# remove any python BLEInterface tests
 echo "📱 Starting UI with target device: $MESHTASTIC_BLE_ADDR"
-echo "📝 Logs will be written to: ~/.retrobadge/meshtastic.log"
-echo "💾 Messages will be stored in: ~/.retrobadge/meshtastic.db"
-echo ""
-
 export MESHTASTIC_BLE_ADDR="$MESHTASTIC_BLE_ADDR"
-
-# Debug: verify the environment variable is set correctly
-python -c "import os; print(f'Python sees MESHTASTIC_BLE_ADDR as: {repr(os.getenv(\"MESHTASTIC_BLE_ADDR\"))}')"
-
 exec python "$UI"
