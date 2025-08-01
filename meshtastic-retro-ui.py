@@ -61,11 +61,11 @@ def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
     except Exception as e:
         json_fh.write(f"# Message handler error: {e}\n")
 
-def on_conn_established(_):
+def on_conn_established(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     link_up_evt.set()
     json_fh.write("# CONNECTION ESTABLISHED\n")
 
-def on_conn_lost(_):
+def on_conn_lost(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     link_up_evt.clear()
     json_fh.write("# CONNECTION LOST\n")
 
