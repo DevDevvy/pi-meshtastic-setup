@@ -18,7 +18,7 @@ from meshtastic.ble_interface import BLEInterface
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
 LOG_FILE = DATA_DIR / "meshtastic.log"
-NODE_ADDR = os.getenv("MESHTASTIC_BLE_ADDR", "48:CA:43:3C:51:FD")  # change to your node's BLE MAC
+NODE_ADDR = os.getenv("MESHTASTIC_BLE_ADDR", "NOT_CONFIGURED")  # Will be set by run_badge.sh
 MAX_LEN, PAD_V = 240, 2  # truncate length, vertical padding
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────────
@@ -79,34 +79,20 @@ def _radio_worker():
     
     # Use the explicit address provided
     addr = NODE_ADDR
-    if not addr or addr == "48:CA:43:3C:51:FD":  # Default placeholder
-        json_fh.write("# No BLE address configured in MESHTASTIC_BLE_ADDR\n")
-        connection_status = "No BLE address configured"
+    json_fh.write(f"# NODE_ADDR from env: '{addr}'\n")
+    
+    # Check if we have a valid address
+    if not addr:
+        json_fh.write(f"# Invalid BLE address: '{addr}'\n")
+        json_fh.write("# Please set MESHTASTIC_BLE_ADDR to your device's MAC address in run_badge.sh\n")
+        connection_status = "No valid BLE address - check run_badge.sh"
         return
     
-    json_fh.write(f"# Using configured BLE address: {addr}\n")
+    addr = addr.strip()  # Remove any whitespace
+    json_fh.write(f"# Using BLE address: '{addr}'\n")
     
-    # Scan to verify the device exists but don't change the address
-    try:
-        json_fh.write("# Scanning to verify device exists...\n")
-        connection_status = "Verifying device exists..."
-        devices = BLEInterface.scan()
-        device_found = False
-        for d in devices:
-            if d.address.upper() == addr.upper():
-                json_fh.write(f"# Target device found: {d.name} @ {d.address}\n")
-                connection_status = f"Target device found: {d.name}"
-                device_found = True
-                break
-        
-        if not device_found:
-            json_fh.write(f"# Warning: Target device {addr} not found in scan\n")
-            json_fh.write(f"# Found devices: {[f'{d.name}@{d.address}' for d in devices]}\n")
-            connection_status = f"Device {addr} not found in scan, trying anyway..."
-        
-    except Exception as e:
-        json_fh.write(f"# Device verification scan failed: {e}, proceeding anyway\n")
-        connection_status = "Scan failed, proceeding anyway..."
+    # Skip the verification scan - go straight to connection attempt
+    connection_status = f"Ready to connect to {addr}"
     
     retry_count = 0
     max_retries = 5
