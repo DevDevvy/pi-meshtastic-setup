@@ -46,18 +46,55 @@ last_connection_attempt = 0
 
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
 def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
-    """Called when a text message is received via pubsub."""
     try:
-        txt_field = getattr(packet.decoded, "text", None) \
-                    or getattr(packet.decoded, "data", {}).get("text", None)
+        txt_field = None
+
+        # 1. packets delivered as dicts
+        if isinstance(packet, dict):
+            dec = packet.get("decoded", {})
+            txt_field = dec.get("text") \
+                      or dec.get("data", {}).get("text")
+
+            # fallback for new-style data.payload (bytes)
+            if txt_field is None and dec.get("data", {}).get("payload"):
+                try:
+                    txt_field = bytes(dec["data"]["payload"]).decode("utf‑8")
+                except Exception:
+                    pass
+
+            src = packet.get("fromId", "unknown")
+            ts  = packet.get("rxTime", time.time())
+
+        # 2. packets delivered as objects
+        else:
+            dec = getattr(packet, "decoded", None)
+            if dec:
+                txt_field = getattr(dec, "text", None)
+
+                if txt_field is None and hasattr(dec, "data"):
+                    # old firmware: decoded.data.text
+                    txt_field = getattr(dec.data, "text", None)
+
+                    # new firmware: decoded.data.payload -> bytes
+                    if txt_field is None and hasattr(dec.data, "payload"):
+                        try:
+                            txt_field = bytes(dec.data.payload).decode("utf‑8")
+                        except Exception:
+                            pass
+
+            src = getattr(packet, "fromId", "unknown")
+            ts  = getattr(packet, "rxTime", time.time())
+
         if txt_field:
-            text = txt_field[:MAX_LEN]
-            src  = getattr(packet, 'fromId', 'unknown')
-            ts   = getattr(packet, 'rxTime', time.time())
+            # timestamp sanity
             if ts > 1e12: ts /= 1000
+            text = txt_field[:MAX_LEN]
+
             json_fh.write(f"# Received: {src}: {text}\n")
             with db:
-                db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+                db.execute(
+                    "INSERT INTO messages VALUES (?,?,?)", (ts, src, text)
+                )
             incoming_q.put((ts, src, text))
     except Exception as e:
         json_fh.write(f"# Message handler error: {e}\n")
@@ -71,22 +108,13 @@ def on_conn_lost(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     json_fh.write("# CONNECTION LOST\n")
 
 # ── PUBSUB SUBSCRIPTIONS ─────────────────────────────────────────────────────
+pub.subscribe(simple_message_handler,        "meshtastic.receive")       # catches all receive.* events :contentReference[oaicite:0]{index=0}
+pub.subscribe(simple_message_handler,        "meshtastic.receive.data")  # catches data-channel packets :contentReference[oaicite:1]{index=1}
 pub.subscribe(simple_message_handler,        "meshtastic.receive.text")
 pub.subscribe(on_conn_established,           "meshtastic.connection.established")
 pub.subscribe(on_conn_lost,                  "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
-def _find_ble_node():
-    json_fh.write("# Scanning for BLE devices…\n")
-    try:
-        devices = BLEInterface.scan()
-        json_fh.write(f"# Found {len(devices)} BLE devices.\n")
-        for d in devices:
-            json_fh.write(f"#   • {d.name} @ {d.address}\n")
-        return devices[0].address if devices else None
-    except Exception as e:
-        json_fh.write(f"# BLE scan error: {e}\n")
-        return None
 
 def _radio_worker():
     global _iface, connection_status, last_connection_attempt
@@ -328,9 +356,9 @@ def _ui(stdscr):
             continue
         if c == 3:
             stop_evt.set()
-            break
+            return
         if stop_evt.is_set():
-            break  # Exit UI loop immediately if stop event is set
+            return  # Exit UI loop immediately if stop event is set
 
         if send_mode:
             # draw the prompt
@@ -385,7 +413,7 @@ def _ui(stdscr):
             send_mode, inp = True, ""
         elif c in (ord('q'), ord('Q')):
             stop_evt.set()
-            break  # Exit UI loop immediately on Q
+            return  # Exit UI loop immediately on Q
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
@@ -395,7 +423,13 @@ def main():
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
     threading.Thread(target=_radio_worker, daemon=True).start()
-    curses.wrapper(_ui)
+    try:
+        curses.wrapper(_ui)
+    except Exception:
+        pass
+    finally:
+        try: curses.endwin()
+        except: pass
     stop_evt.set()
     json_fh.close()
     db.close()
