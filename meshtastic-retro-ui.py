@@ -359,7 +359,7 @@ def _ui(stdscr):
             continue
         if c == 3:
             stop_evt.set()
-            return
+            raise KeyboardInterrupt
         if stop_evt.is_set():
             return  # Exit UI loop immediately if stop event is set
 
@@ -416,7 +416,7 @@ def _ui(stdscr):
             send_mode, inp = True, ""
         elif c in (ord('q'), ord('Q')):
             stop_evt.set()
-            return  # Exit UI loop immediately on Q
+            raise KeyboardInterrupt  # Exit UI loop immediately on Q
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
@@ -428,11 +428,8 @@ def main():
     threading.Thread(target=_radio_worker, daemon=True).start()
     try:
         curses.wrapper(_ui)
-    except Exception:
+    except KeyboardInterrupt:
         pass
-    finally:
-        try: curses.endwin()
-        except: pass
     stop_evt.set()
     json_fh.close()
     db.close()
