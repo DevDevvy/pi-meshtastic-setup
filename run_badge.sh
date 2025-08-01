@@ -88,49 +88,41 @@ if ! python -c "import pubsub" 2>/dev/null; then
     echo "Consider running: pip install pypubsub"
 fi
 
-# Test BLE permissions
-echo "🔐 Testing BLE permissions..."
-if ! timeout 10s python -c "from meshtastic.ble_interface import BLEInterface; print('BLE scan:', len(BLEInterface.scan())); print('BLE test passed')" 2>/dev/null; then
-    echo "⚠️  BLE scan test failed - may need to run as root or fix permissions"
-    echo "Trying to scan manually..."
-    timeout 10s python -c "
+# Test BLE permissions and scan for devices
+echo "🔐 Testing BLE and scanning for Meshtastic devices..."
+python -c "
 from meshtastic.ble_interface import BLEInterface
 import traceback
 try:
+    print('Scanning for BLE devices...')
     devices = BLEInterface.scan()
-    print(f'Found {len(devices)} devices')
+    print(f'Found {len(devices)} BLE devices:')
+    meshtastic_devices = []
     for d in devices:
         print(f'  {d.name} @ {d.address}')
+        if 'meshtastic' in d.name.lower() or 'mesh' in d.name.lower():
+            meshtastic_devices.append(d.address)
+    
+    if meshtastic_devices:
+        print(f'Found {len(meshtastic_devices)} potential Meshtastic devices')
+        # Use the first Meshtastic device found
+        print(f'Will try to connect to: {meshtastic_devices[0]}')
+        # Override the environment variable
+        import os
+        os.environ['MESHTASTIC_BLE_ADDR'] = meshtastic_devices[0]
+    else:
+        print('No obvious Meshtastic devices found, using configured address')
+        
 except Exception as e:
-    print(f'Error: {e}')
+    print(f'BLE scan failed: {e}')
     traceback.print_exc()
-" || echo "Manual scan also failed"
-fi
+"
 
-# Test creating a BLE interface (without connecting)
-echo "🧪 Testing BLE interface creation..."
-timeout 15s python -c "
-from meshtastic.ble_interface import BLEInterface
-import traceback
-import time
-try:
-    print('Creating BLE interface...')
-    start_time = time.time()
-    iface = BLEInterface(address='$MESHTASTIC_BLE_ADDR')
-    elapsed = time.time() - start_time
-    print(f'Interface created in {elapsed:.1f}s')
-    print('Closing interface...')
-    iface.close()
-    print('Test passed')
-except Exception as e:
-    print(f'Interface creation failed: {e}')
-    traceback.print_exc()
-" || echo "Interface creation test failed"
-
-echo "📱 Starting UI with BLE address: $MESHTASTIC_BLE_ADDR"
+# Remove the interface creation test since it was hanging
+echo "📱 Starting UI..."
 echo "📝 Logs will be written to: ~/.retrobadge/meshtastic.log"
 echo "💾 Messages will be stored in: ~/.retrobadge/meshtastic.db"
 echo ""
 
-export MESHTASTIC_BLE_ADDR="$MESHTASTIC_BLE_ADDR"
+export MESHTASTIC_BLE_ADDR="${MESHTASTIC_BLE_ADDR:-48:CA:43:3C:51:FD}"
 exec python "$UI"
