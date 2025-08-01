@@ -44,11 +44,13 @@ connection_status = "Initializing..."  # For UI display
 last_connection_attempt = 0
 
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
-def simple_message_handler(packet):
+def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
     """Called when a text message is received via pubsub."""
     try:
-        if hasattr(packet, 'decoded') and hasattr(packet.decoded, 'text'):
-            text = packet.decoded.text[:MAX_LEN]
+        txt_field = getattr(packet.decoded, "text", None) \
+                    or getattr(packet.decoded, "data", {}).get("text", None)
+        if txt_field:
+            text = txt_field[:MAX_LEN]
             src  = getattr(packet, 'fromId', 'unknown')
             ts   = getattr(packet, 'rxTime', time.time())
             if ts > 1e12: ts /= 1000

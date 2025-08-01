@@ -57,15 +57,7 @@ if ! hciconfig hci0 | grep -q "UP RUNNING"; then
     exit 1
 fi
 
-# Just do a quick scan to see what's available, but don't test connections
-echo "📡 Quick device scan..."
-timeout 3s bluetoothctl scan on >/dev/null 2>&1 &
-SCAN_PID=$!
-sleep 2
-kill $SCAN_PID 2>/dev/null || true
 
-echo "Available BLE devices:"
-bluetoothctl devices | head -10
 
 # Check if target device is in bluetooth cache (non-blocking)
 if bluetoothctl info "$MESHTASTIC_BLE_ADDR" >/dev/null 2>&1; then
@@ -85,7 +77,7 @@ if ! python -c "import meshtastic" 2>/dev/null; then
 fi
 if ! python -c "import pubsub" 2>/dev/null; then
     echo "❌ pubsub package not found in venv"
-    echo "Please run: pip install pypubsub"
+    pip install pypubsub
     exit 1
 fi
 
