@@ -47,6 +47,8 @@ link_up_evt = threading.Event()
 stop_evt    = threading.Event()
 _iface_lock = threading.Lock()
 _iface      = None
+connection_status = "Initializing..."  # For UI display
+last_connection_attempt = 0
 
 # ── BLE CALLBACKS ────────────────────────────────────────────────────────────
 def on_receive_text(packet, interface=None):
@@ -129,10 +131,11 @@ def _find_ble_node():
 
 
 def _radio_worker():
-    global _iface
+    global _iface, connection_status, last_connection_attempt
     addr = NODE_ADDR or _find_ble_node()
     if not addr:
         json_fh.write("# No BLE address available\n")
+        connection_status = "No BLE address"
         return
     
     retry_count = 0
@@ -140,6 +143,8 @@ def _radio_worker():
     
     while not stop_evt.is_set() and retry_count < max_retries:
         try:
+            last_connection_attempt = time.time()
+            connection_status = f"Connecting... (attempt {retry_count + 1}/{max_retries})"
             json_fh.write(f"# Attempt {retry_count + 1}/{max_retries}: Connecting to {addr}\n")
             
             # Clear any previous connection state
@@ -147,10 +152,13 @@ def _radio_worker():
             
             # Create interface in a separate try block to catch connection errors early
             json_fh.write("# Creating BLE interface...\n")
+            connection_status = "Creating BLE interface..."
+            
             with _iface_lock:
                 _iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False, noNodes=False)
             
             json_fh.write("# BLE interface created successfully\n")
+            connection_status = "Interface created, handshaking..."
             
             # Give time for the initial connection handshake
             connection_wait_time = 15
@@ -161,9 +169,12 @@ def _radio_worker():
                 if stop_evt.is_set():
                     break
                     
+                connection_status = f"Handshake... ({i+1}/{connection_wait_time}s)"
+                
                 # Check if pubsub events have set the link up
                 if link_up_evt.is_set():
                     json_fh.write(f"# Connection established via pubsub after {i+1}s\n")
+                    connection_status = "Connected via pubsub!"
                     break
                     
                 # Also try to verify by attempting to get basic info
@@ -174,7 +185,9 @@ def _radio_worker():
                             my_info = _iface.getMyNodeInfo()
                             if my_info and 'user' in my_info:
                                 json_fh.write(f"# Connection verified via getMyNodeInfo after {i+1}s\n")
+                                json_fh.write(f"# Node info: {my_info}\n")
                                 link_up_evt.set()
+                                connection_status = "Connected via node info!"
                                 break
                 except Exception as e:
                     # This is expected while connecting, don't log as error
@@ -186,8 +199,10 @@ def _radio_worker():
             connection_verified = False
             if link_up_evt.is_set():
                 connection_verified = True
+                connection_status = "Connection verified!"
             else:
                 # Try one more time to verify connection
+                connection_status = "Final verification..."
                 try:
                     with _iface_lock:
                         if _iface:
@@ -199,10 +214,13 @@ def _radio_worker():
                                 json_fh.write(f"# Connection verified! Node: {user_name} ({node_id})\n")
                                 link_up_evt.set()
                                 connection_verified = True
+                                connection_status = f"Connected to {user_name}!"
                             else:
                                 json_fh.write("# getMyNodeInfo returned None\n")
+                                connection_status = "Node info failed"
                 except Exception as e:
                     json_fh.write(f"# Final verification failed: {e}\n")
+                    connection_status = f"Verification failed: {e}"
             
             if connection_verified:
                 json_fh.write("# Entering main communication loop\n")
@@ -215,8 +233,10 @@ def _radio_worker():
                             # Get some basic info to show we're really connected
                             nodes = _iface.nodes
                             json_fh.write(f"# Network has {len(nodes)} known nodes\n")
+                            connection_status = f"Connected! {len(nodes)} nodes"
                 except Exception as e:
                     json_fh.write(f"# Warning getting nodes: {e}\n")
+                    connection_status = "Connected (node count failed)"
                 
                 # Main message loop
                 last_activity = time.time()
@@ -228,6 +248,7 @@ def _radio_worker():
                         # Try to get a message with a timeout
                         msg = outgoing_q.get(timeout=5.0)
                         json_fh.write(f"# Sending message: '{msg}'\n")
+                        connection_status = f"Sending: {msg[:20]}..."
                         
                         with _iface_lock:
                             if _iface:
@@ -236,10 +257,15 @@ def _radio_worker():
                                 json_fh.write("# Message sent successfully\n")
                                 last_activity = time.time()
                                 consecutive_errors = 0
+                                connection_status = "Message sent!"
                                 
                     except queue.Empty:
                         # No message to send - do periodic connection check
                         current_time = time.time()
+                        
+                        # Update status to show we're idle but connected
+                        if link_up_evt.is_set():
+                            connection_status = "Connected (idle)"
                         
                         # Send periodic heartbeat/connection check
                         if current_time - last_activity > heartbeat_interval:
@@ -250,17 +276,21 @@ def _radio_worker():
                                         _ = _iface.nodes
                                         last_activity = current_time
                                         json_fh.write("# Connection heartbeat OK\n")
+                                        connection_status = "Connected (heartbeat OK)"
                             except Exception as e:
                                 json_fh.write(f"# Heartbeat failed: {e}\n")
                                 consecutive_errors += 1
+                                connection_status = f"Heartbeat failed: {e}"
                                 
                     except Exception as e:
                         json_fh.write(f"# Send error: {e}\n")
                         consecutive_errors += 1
+                        connection_status = f"Send error: {e}"
                         
                         # If we get repeated send errors, the connection is probably dead
                         if consecutive_errors >= 3:
                             json_fh.write("# Too many consecutive send errors, connection likely dead\n")
+                            connection_status = "Connection dead (send errors)"
                             break
                             
                 json_fh.write("# Exiting main communication loop\n")
@@ -268,12 +298,14 @@ def _radio_worker():
             else:
                 json_fh.write("# Connection verification failed\n")
                 retry_count += 1
+                connection_status = f"Verification failed (retry {retry_count})"
                 
         except Exception as e:
             json_fh.write(f"# Radio worker error: {e}\n")
             import traceback
             json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
             retry_count += 1
+            connection_status = f"Error: {str(e)[:50]}..."
             
         finally:
             # Always clean up the interface
@@ -292,10 +324,12 @@ def _radio_worker():
             if not stop_evt.is_set() and retry_count < max_retries:
                 wait_time = min(10 + retry_count * 5, 60)  # Longer backoff
                 json_fh.write(f"# Retrying in {wait_time}s... (attempt {retry_count}/{max_retries})\n")
+                connection_status = f"Retrying in {wait_time}s..."
                 stop_evt.wait(wait_time)
     
     if retry_count >= max_retries:
         json_fh.write(f"# Max retries ({max_retries}) exceeded, radio worker exiting\n")
+        connection_status = "Max retries exceeded"
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
@@ -325,10 +359,12 @@ def _ui(stdscr):
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_RED,   curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_BLUE,  curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
     text_col = curses.color_pair(1)
     no_link  = curses.color_pair(2)
     yes_link = curses.color_pair(3)
+    warn_col = curses.color_pair(4)
 
     msgs    = _history()
     viewofs = max(0, len(msgs) - (curses.LINES - PAD_V*2 - 2))
@@ -342,6 +378,10 @@ def _ui(stdscr):
         try:
             while True:
                 msgs.append(incoming_q.get_nowait())
+                # Auto-scroll to new messages
+                h, w = stdscr.getmaxyx()
+                pane_h = h - PAD_V*2 - 2
+                viewofs = max(0, len(msgs) - pane_h)
         except queue.Empty:
             pass
 
@@ -352,11 +392,32 @@ def _ui(stdscr):
 
         stdscr.erase()
         stdscr.addstr(0, 0, "╔" + TITLE.center(w-2, "═")[:w-2] + "╗", text_col)
-        status = "[● LINKED]" if link_up_evt.is_set() else "[○ NO LINK]"
-        safe_footer(stdscr, 1, status.center(w-1), yes_link if link_up_evt.is_set() else no_link)
+        
+        # Show detailed connection status
+        if link_up_evt.is_set():
+            status = "[● LINKED]"
+            status_attr = yes_link
+        else:
+            status = "[○ NO LINK]"
+            status_attr = no_link
+        
+        # Add detailed status on second line
+        detailed_status = f"Status: {connection_status}"[:w-1]
+        safe_footer(stdscr, 1, status.center(w-1), status_attr)
+        
+        # Add a third line for detailed connection info
+        if h > 10:  # Only if we have enough screen space
+            time_since_attempt = time.time() - last_connection_attempt if last_connection_attempt > 0 else 0
+            debug_info = f"Last attempt: {time_since_attempt:.0f}s ago | {detailed_status}"[:w-1]
+            safe_footer(stdscr, 2, debug_info, warn_col)
+            # Adjust message area to account for extra status line
+            pane_h -= 1
+            row_start = PAD_V + 3
+        else:
+            row_start = PAD_V + 2
 
         # render wrapped history
-        row, used, idx = PAD_V + 2, 0, viewofs
+        row, used, idx = row_start, 0, viewofs
         while used < pane_h and idx < len(msgs):
             ts, src, txt = msgs[idx]
             prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
