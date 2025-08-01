@@ -293,15 +293,22 @@ def _ui(stdscr):
 
     while not stop_evt.is_set():
         # drain incoming messages
+        new_msgs_added = False
         try:
             while True:
-                msgs.append(incoming_q.get_nowait())
-                # Auto-scroll to new messages
-                h, w = stdscr.getmaxyx()
-                pane_h = h - PAD_V*2 - 2
-                viewofs = max(0, len(msgs) - pane_h)
+                new_msg = incoming_q.get_nowait()
+                msgs.append(new_msg)
+                new_msgs_added = True
         except queue.Empty:
             pass
+
+        # Auto-scroll to new messages if we were already at the bottom
+        if new_msgs_added:
+            h, w = stdscr.getmaxyx()
+            pane_h = h - PAD_V*2 - 2
+            # If we were at or near the bottom, auto-scroll to show new messages
+            if viewofs >= max(0, len(msgs) - pane_h - 5):  # within 5 messages of bottom
+                viewofs = max(0, len(msgs) - pane_h)
 
         h, w = stdscr.getmaxyx()
         pane_h = h - PAD_V*2 - 2
@@ -331,7 +338,7 @@ def _ui(stdscr):
             ts, src, txt = msgs[idx]
             prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
             avail = w - len(prefix)
-            for j, line in enumerate(textwrap.wrap(txt, width=avail) or [""]):
+            for j, line in textwrap.wrap(txt, width=avail) or [""]:
                 if used >= pane_h: break
                 if j == 0:
                     line_out = (prefix + line).ljust(w)[:w]
