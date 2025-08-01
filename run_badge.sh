@@ -83,5 +83,21 @@ if ! python -c "import meshtastic" 2>/dev/null; then
     exit 1
 fi
 
+if ! python -c "import pubsub" 2>/dev/null; then
+    echo "⚠️  pubsub package not found, message receiving may not work"
+    echo "Consider running: pip install pypubsub"
+fi
+
+# Test BLE permissions
+echo "🔐 Testing BLE permissions..."
+if ! python -c "from meshtastic.ble_interface import BLEInterface; BLEInterface.scan()" 2>/dev/null; then
+    echo "⚠️  BLE scan test failed - may need to run as root or fix permissions"
+fi
+
+echo "📱 Starting UI with BLE address: $MESHTASTIC_BLE_ADDR"
+echo "📝 Logs will be written to: ~/.retrobadge/meshtastic.log"
+echo "💾 Messages will be stored in: ~/.retrobadge/meshtastic.db"
+echo ""
+
 export MESHTASTIC_BLE_ADDR="$MESHTASTIC_BLE_ADDR"
 exec python "$UI"

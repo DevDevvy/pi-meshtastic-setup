@@ -142,76 +142,142 @@ def _radio_worker():
         try:
             json_fh.write(f"# Attempt {retry_count + 1}/{max_retries}: Connecting to {addr}\n")
             
-            # Create interface - this should trigger pubsub events
+            # Clear any previous connection state
+            link_up_evt.clear()
+            
+            # Create interface in a separate try block to catch connection errors early
+            json_fh.write("# Creating BLE interface...\n")
             with _iface_lock:
-                _iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False)
+                _iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False, noNodes=False)
             
-            json_fh.write("# BLE interface created, waiting for connection...\n")
+            json_fh.write("# BLE interface created successfully\n")
             
-            # Give time for initial connection and protocol handshake
-            time.sleep(5)
+            # Give time for the initial connection handshake
+            connection_wait_time = 15
+            json_fh.write(f"# Waiting {connection_wait_time}s for connection handshake...\n")
             
-            # Try to verify connection by getting node info
+            # Check for connection in smaller intervals
+            for i in range(connection_wait_time):
+                if stop_evt.is_set():
+                    break
+                    
+                # Check if pubsub events have set the link up
+                if link_up_evt.is_set():
+                    json_fh.write(f"# Connection established via pubsub after {i+1}s\n")
+                    break
+                    
+                # Also try to verify by attempting to get basic info
+                try:
+                    with _iface_lock:
+                        if _iface:
+                            # Try to get my node info as a connection test
+                            my_info = _iface.getMyNodeInfo()
+                            if my_info and 'user' in my_info:
+                                json_fh.write(f"# Connection verified via getMyNodeInfo after {i+1}s\n")
+                                link_up_evt.set()
+                                break
+                except Exception as e:
+                    # This is expected while connecting, don't log as error
+                    pass
+                    
+                time.sleep(1)
+            
+            # Final connection verification
             connection_verified = False
-            try:
-                with _iface_lock:
-                    if _iface:
-                        json_fh.write("# Attempting to get node info...\n")
-                        node_info = _iface.getMyNodeInfo()
-                        if node_info:
-                            user_name = node_info.get('user', {}).get('longName', 'Unknown')
-                            json_fh.write(f"# Node verified: {user_name}\n")
-                            link_up_evt.set()
-                            connection_verified = True
-                        else:
-                            json_fh.write("# No node info received\n")
-            except Exception as e:
-                json_fh.write(f"# Error getting node info: {e}\n")
+            if link_up_evt.is_set():
+                connection_verified = True
+            else:
+                # Try one more time to verify connection
+                try:
+                    with _iface_lock:
+                        if _iface:
+                            json_fh.write("# Final connection verification attempt...\n")
+                            my_info = _iface.getMyNodeInfo()
+                            if my_info:
+                                user_name = my_info.get('user', {}).get('longName', 'Unknown')
+                                node_id = my_info.get('user', {}).get('id', 'Unknown')
+                                json_fh.write(f"# Connection verified! Node: {user_name} ({node_id})\n")
+                                link_up_evt.set()
+                                connection_verified = True
+                            else:
+                                json_fh.write("# getMyNodeInfo returned None\n")
+                except Exception as e:
+                    json_fh.write(f"# Final verification failed: {e}\n")
             
-            if connection_verified or link_up_evt.is_set():
-                json_fh.write("# Connection appears successful, entering message loop\n")
+            if connection_verified:
+                json_fh.write("# Entering main communication loop\n")
                 retry_count = 0  # Reset retry count on successful connection
                 
-                # Main message loop - keep running while connected
+                # Send a test message to verify sending works
+                try:
+                    with _iface_lock:
+                        if _iface:
+                            # Get some basic info to show we're really connected
+                            nodes = _iface.nodes
+                            json_fh.write(f"# Network has {len(nodes)} known nodes\n")
+                except Exception as e:
+                    json_fh.write(f"# Warning getting nodes: {e}\n")
+                
+                # Main message loop
+                last_activity = time.time()
+                heartbeat_interval = 30  # Send a heartbeat every 30 seconds
                 consecutive_errors = 0
-                while not stop_evt.is_set() and consecutive_errors < 5:
+                
+                while not stop_evt.is_set() and consecutive_errors < 3:
                     try:
-                        msg = outgoing_q.get(timeout=2.0)
-                        json_fh.write(f"# Sending message: {msg}\n")
+                        # Try to get a message with a timeout
+                        msg = outgoing_q.get(timeout=5.0)
+                        json_fh.write(f"# Sending message: '{msg}'\n")
+                        
                         with _iface_lock:
                             if _iface:
+                                # Send the message
                                 _iface.sendText(msg)
                                 json_fh.write("# Message sent successfully\n")
+                                last_activity = time.time()
                                 consecutive_errors = 0
+                                
                     except queue.Empty:
-                        # No message to send, check if interface is still alive
-                        try:
-                            with _iface_lock:
-                                if _iface and hasattr(_iface, 'client') and _iface.client:
-                                    # Try a simple operation to test if connection is alive
-                                    continue
-                                else:
-                                    json_fh.write("# Interface appears disconnected\n")
-                                    break
-                        except Exception as e:
-                            json_fh.write(f"# Interface check error: {e}\n")
-                            consecutive_errors += 1
+                        # No message to send - do periodic connection check
+                        current_time = time.time()
+                        
+                        # Send periodic heartbeat/connection check
+                        if current_time - last_activity > heartbeat_interval:
+                            try:
+                                with _iface_lock:
+                                    if _iface:
+                                        # Just try to access a simple property to verify connection
+                                        _ = _iface.nodes
+                                        last_activity = current_time
+                                        json_fh.write("# Connection heartbeat OK\n")
+                            except Exception as e:
+                                json_fh.write(f"# Heartbeat failed: {e}\n")
+                                consecutive_errors += 1
+                                
                     except Exception as e:
                         json_fh.write(f"# Send error: {e}\n")
                         consecutive_errors += 1
-                        if consecutive_errors >= 5:
-                            json_fh.write("# Too many consecutive errors, reconnecting\n")
+                        
+                        # If we get repeated send errors, the connection is probably dead
+                        if consecutive_errors >= 3:
+                            json_fh.write("# Too many consecutive send errors, connection likely dead\n")
                             break
+                            
+                json_fh.write("# Exiting main communication loop\n")
+                
             else:
                 json_fh.write("# Connection verification failed\n")
                 retry_count += 1
                 
         except Exception as e:
             json_fh.write(f"# Radio worker error: {e}\n")
+            import traceback
+            json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
             retry_count += 1
             
         finally:
             # Always clean up the interface
+            json_fh.write("# Cleaning up interface\n")
             link_up_evt.clear()
             with _iface_lock:
                 if _iface:
@@ -224,19 +290,12 @@ def _radio_worker():
             
             # Wait before retry if not stopping
             if not stop_evt.is_set() and retry_count < max_retries:
-                wait_time = min(5 + retry_count * 2, 30)  # Exponential backoff, max 30s
-                json_fh.write(f"# Retrying in {wait_time}s...\n")
+                wait_time = min(10 + retry_count * 5, 60)  # Longer backoff
+                json_fh.write(f"# Retrying in {wait_time}s... (attempt {retry_count}/{max_retries})\n")
                 stop_evt.wait(wait_time)
-                
-                # Try to find a new device if we don't have a fixed address
-                if not NODE_ADDR:
-                    new_addr = _find_ble_node()
-                    if new_addr and new_addr != addr:
-                        addr = new_addr
-                        retry_count = 0  # Reset on new device
     
     if retry_count >= max_retries:
-        json_fh.write(f"# Max retries ({max_retries}) exceeded, giving up\n")
+        json_fh.write(f"# Max retries ({max_retries}) exceeded, radio worker exiting\n")
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
