@@ -14,6 +14,12 @@ from pathlib import Path
 from datetime import datetime
 from meshtastic.ble_interface import BLEInterface
 
+try:
+    from pubsub import pub
+    PUBSUB_AVAILABLE = True
+except ImportError:
+    PUBSUB_AVAILABLE = False
+
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DATA_DIR = Path.home() / ".retrobadge"; DATA_DIR.mkdir(exist_ok=True)
 DB_FILE  = DATA_DIR / "meshtastic.db"
@@ -23,6 +29,8 @@ MAX_LEN, PAD_V = 240, 2  # truncate length, vertical padding
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────────
 json_fh = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+if not PUBSUB_AVAILABLE:
+    json_fh.write("# Warning: pubsub not available, message receiving may not work\n")
 db      = sqlite3.connect(DB_FILE, check_same_thread=False)
 with db:
     db.execute("""
@@ -41,62 +49,194 @@ _iface_lock = threading.Lock()
 _iface      = None
 
 # ── BLE CALLBACKS ────────────────────────────────────────────────────────────
-def on_receive(packet, interface):
-    """Called on every incoming Meshtastic packet over BLE."""
+def on_receive_text(packet, interface=None):
+    """Called when a text message is received via pubsub."""
     try:
-        text = packet['decoded']['text']
-        src  = packet.get('from', {}).get('userAlias', 'unknown')
-    except Exception:
-        return
-    ts = getattr(packet, 'rxTime', time.time())
-    if ts > 1e12: ts /= 1000
-    # log and persist
-    json_fh.write(json.dumps(packet, default=str) + "\n")
-    with db:
-        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
-    incoming_q.put((ts, src, text))
+        # Extract text from the packet
+        if hasattr(packet, 'decoded') and hasattr(packet.decoded, 'text'):
+            text = packet.decoded.text[:MAX_LEN]
+        elif isinstance(packet, dict) and 'decoded' in packet and 'text' in packet['decoded']:
+            text = packet['decoded']['text'][:MAX_LEN]
+        else:
+            return
+        
+        # Get sender info - try different ways to extract it
+        from_id = 'unknown'
+        if hasattr(packet, 'fromId'):
+            from_id = packet.fromId
+        elif isinstance(packet, dict) and 'fromId' in packet:
+            from_id = packet['fromId']
+        elif hasattr(packet, 'from'):
+            from_id = f"!{packet['from']:08x}"
+        elif isinstance(packet, dict) and 'from' in packet:
+            from_id = f"!{packet['from']:08x}"
+        
+        # Get timestamp
+        ts = time.time()
+        if hasattr(packet, 'rxTime'):
+            ts = packet.rxTime
+        elif isinstance(packet, dict) and 'rxTime' in packet:
+            ts = packet['rxTime']
+        
+        if ts > 1e12:
+            ts /= 1000
+        
+        # Log and persist
+        json_fh.write(f"# Received message from {from_id}: {text}\n")
+        json_fh.write(json.dumps(packet, default=str) + "\n")
+        
+        with db:
+            db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, from_id, text))
+        incoming_q.put((ts, from_id, text))
+        
+    except Exception as e:
+        json_fh.write(f"# Error processing received packet: {e}\n")
 
 
-def on_connection_established(interface):
-    """BLE link up"""
+def on_connection_established(interface=None, topic=None):
+    """Called when BLE connection is established via pubsub."""
     link_up_evt.set()
-    json_fh.write(f"# LINK UP to {interface.address}\n")
+    addr = getattr(interface, 'address', 'unknown') if interface else 'unknown'
+    json_fh.write(f"# CONNECTION ESTABLISHED to {addr}\n")
 
 
-def on_connection_lost(interface):
-    """BLE link lost"""
+def on_connection_lost(interface=None, topic=None):
+    """Called when BLE connection is lost via pubsub."""
     link_up_evt.clear()
-    json_fh.write(f"# LINK DOWN from {interface.address}\n")
+    addr = getattr(interface, 'address', 'unknown') if interface else 'unknown'
+    json_fh.write(f"# CONNECTION LOST from {addr}\n")
+
+
+# Set up pubsub subscriptions if available
+if PUBSUB_AVAILABLE:
+    pub.subscribe(on_receive_text, "meshtastic.receive.text")
+    pub.subscribe(on_connection_established, "meshtastic.connection.established")
+    pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
+    json_fh.write("# Pubsub callbacks registered\n")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 def _find_ble_node():
     json_fh.write("# Scanning for BLE devices…\n")
-    devices = BLEInterface.scan()
-    json_fh.write(f"# Found {len(devices)} BLE devices.\n")
-    for d in devices:
-        json_fh.write(f"#   • {d.name} @ {d.address}\n")
-    return devices[0].address if devices else None
+    try:
+        devices = BLEInterface.scan()
+        json_fh.write(f"# Found {len(devices)} BLE devices.\n")
+        for d in devices:
+            json_fh.write(f"#   • {d.name} @ {d.address}\n")
+        return devices[0].address if devices else None
+    except Exception as e:
+        json_fh.write(f"# BLE scan error: {e}\n")
+        return None
 
 
 def _radio_worker():
     global _iface
     addr = NODE_ADDR or _find_ble_node()
-    # instantiate and assign callbacks
-    iface = BLEInterface(address=addr, debugOut=json_fh)
-    iface.onReceive               = on_receive
-    iface.onConnectionEstablished = on_connection_established
-    iface.onConnectionLost        = on_connection_lost
-    # sender thread: flush outgoing_q
-    def _sender():
-        while not stop_evt.wait(0.1):
+    if not addr:
+        json_fh.write("# No BLE address available\n")
+        return
+    
+    retry_count = 0
+    max_retries = 10
+    
+    while not stop_evt.is_set() and retry_count < max_retries:
+        try:
+            json_fh.write(f"# Attempt {retry_count + 1}/{max_retries}: Connecting to {addr}\n")
+            
+            # Create interface - this should trigger pubsub events
+            with _iface_lock:
+                _iface = BLEInterface(address=addr, debugOut=json_fh, noProto=False)
+            
+            json_fh.write("# BLE interface created, waiting for connection...\n")
+            
+            # Give time for initial connection and protocol handshake
+            time.sleep(5)
+            
+            # Try to verify connection by getting node info
+            connection_verified = False
             try:
-                msg = outgoing_q.get_nowait()
-                iface.sendText(msg)
-            except queue.Empty:
-                pass
-    threading.Thread(target=_sender, daemon=True).start()
-    # run BLE event loop (handles reconnects internally)
-    iface.loop_forever()
+                with _iface_lock:
+                    if _iface:
+                        json_fh.write("# Attempting to get node info...\n")
+                        node_info = _iface.getMyNodeInfo()
+                        if node_info:
+                            user_name = node_info.get('user', {}).get('longName', 'Unknown')
+                            json_fh.write(f"# Node verified: {user_name}\n")
+                            link_up_evt.set()
+                            connection_verified = True
+                        else:
+                            json_fh.write("# No node info received\n")
+            except Exception as e:
+                json_fh.write(f"# Error getting node info: {e}\n")
+            
+            if connection_verified or link_up_evt.is_set():
+                json_fh.write("# Connection appears successful, entering message loop\n")
+                retry_count = 0  # Reset retry count on successful connection
+                
+                # Main message loop - keep running while connected
+                consecutive_errors = 0
+                while not stop_evt.is_set() and consecutive_errors < 5:
+                    try:
+                        msg = outgoing_q.get(timeout=2.0)
+                        json_fh.write(f"# Sending message: {msg}\n")
+                        with _iface_lock:
+                            if _iface:
+                                _iface.sendText(msg)
+                                json_fh.write("# Message sent successfully\n")
+                                consecutive_errors = 0
+                    except queue.Empty:
+                        # No message to send, check if interface is still alive
+                        try:
+                            with _iface_lock:
+                                if _iface and hasattr(_iface, 'client') and _iface.client:
+                                    # Try a simple operation to test if connection is alive
+                                    continue
+                                else:
+                                    json_fh.write("# Interface appears disconnected\n")
+                                    break
+                        except Exception as e:
+                            json_fh.write(f"# Interface check error: {e}\n")
+                            consecutive_errors += 1
+                    except Exception as e:
+                        json_fh.write(f"# Send error: {e}\n")
+                        consecutive_errors += 1
+                        if consecutive_errors >= 5:
+                            json_fh.write("# Too many consecutive errors, reconnecting\n")
+                            break
+            else:
+                json_fh.write("# Connection verification failed\n")
+                retry_count += 1
+                
+        except Exception as e:
+            json_fh.write(f"# Radio worker error: {e}\n")
+            retry_count += 1
+            
+        finally:
+            # Always clean up the interface
+            link_up_evt.clear()
+            with _iface_lock:
+                if _iface:
+                    try:
+                        _iface.close()
+                        json_fh.write("# Interface closed cleanly\n")
+                    except Exception as e:
+                        json_fh.write(f"# Error closing interface: {e}\n")
+                    _iface = None
+            
+            # Wait before retry if not stopping
+            if not stop_evt.is_set() and retry_count < max_retries:
+                wait_time = min(5 + retry_count * 2, 30)  # Exponential backoff, max 30s
+                json_fh.write(f"# Retrying in {wait_time}s...\n")
+                stop_evt.wait(wait_time)
+                
+                # Try to find a new device if we don't have a fixed address
+                if not NODE_ADDR:
+                    new_addr = _find_ble_node()
+                    if new_addr and new_addr != addr:
+                        addr = new_addr
+                        retry_count = 0  # Reset on new device
+    
+    if retry_count >= max_retries:
+        json_fh.write(f"# Max retries ({max_retries}) exceeded, giving up\n")
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:

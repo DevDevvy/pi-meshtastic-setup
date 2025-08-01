@@ -47,26 +47,7 @@ python3 -m venv "$VENV_DIR"
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install meshtastic[ble] pubsub
-
-echo "🛠️  7/7  Creating systemd service meshtastic-badge…"
-cat <<EOF > "$SERVICE_FILE"
-[Unit]
-Description=Meshtastic Retro Badge (curses UI)
-After=bluetooth.target network.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=$REAL_USER
-WorkingDirectory=$PROJECT_DIR
-ExecStart=$PROJECT_DIR/run_badge.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+pip install meshtastic[ble] 
 
 chmod 644 "$SERVICE_FILE"
 systemctl daemon-reload
