@@ -10,6 +10,7 @@ Retro Meshtastic Badge – 3.5” Touch, Headless Edition
 • Persists to ~/.retrobadge/{meshtastic.db,meshtastic.log}
 """
 import os, json, sqlite3, signal, queue, threading, time, curses, textwrap
+import curses.textpad
 from pathlib import Path
 from datetime import datetime
 from meshtastic.ble_interface import BLEInterface
@@ -238,6 +239,7 @@ def safe_footer(win, row: int, text: str, attr=0):
 # ── CURSES UI ─────────────────────────────────────────────────────────────────
 def _ui(stdscr):
     curses.curs_set(0)
+    stdscr.keypad(True)
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     curses.start_color()
     curses.use_default_colors()
@@ -324,26 +326,44 @@ def _ui(stdscr):
             c = stdscr.getch()
         except curses.error:
             continue
-
+        if c == 3:
+            stop_evt.set()
+            break
         if stop_evt.is_set():
             break  # Exit UI loop immediately if stop event is set
 
         if send_mode:
-            if c in (10, 13):  # Enter
-                msg = inp.strip()
-                send_mode, inp = False, ""
-                if msg:
-                    ts = time.time()
-                    with db:
-                        db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", msg))
-                    msgs.append((ts, "You", msg))
-                    outgoing_q.put(msg)
-            elif c in (27,):    # Esc
-                send_mode = False
-            elif c in (127, 8): # Backspace
-                inp = inp[:-1]
-            elif 32 <= c <= 126:
-                inp += chr(c)
+            # draw the prompt
+            h, w = stdscr.getmaxyx()
+            prompt = "Send> "
+            stdscr.addstr(h-1, 0, prompt, text_col)
+            stdscr.clrtoeol()
+            curses.curs_set(1)
+            stdscr.refresh()
+
+            # new 1-line window for text entry
+            win = curses.newwin(1, w - len(prompt) - 1, h-1, len(prompt))
+            win.keypad(True)
+            tb = curses.textpad.Textbox(win, insert_mode=True)
+
+            # make Enter finish editing
+            def validator(ch):
+                if ch in (10, 13):
+                    return 7    # Ctrl-G, the default "end edit" trigger
+                return ch
+
+            try:
+                s = tb.edit(validator).strip()
+            finally:
+                curses.curs_set(0)
+
+            send_mode = False
+            if s:
+                ts = time.time()
+                with db:
+                    db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", s))
+                msgs.append((ts, "You", s))
+                outgoing_q.put(s)
             continue
 
         # navigation keys
@@ -367,17 +387,9 @@ def _ui(stdscr):
             stop_evt.set()
             break  # Exit UI loop immediately on Q
 
-    # Ensure terminal is restored on exit
-    curses.endwin()
-
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
     stop_evt.set()
-    try:
-        curses.endwin()
-    except Exception:
-        pass
-
 
 def main():
     signal.signal(signal.SIGINT,  _sig)
