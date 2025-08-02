@@ -269,10 +269,10 @@ def safe_footer(win, row: int, text: str, attr=0):
 
 # ── CURSES UI ─────────────────────────────────────────────────────────────────
 def _ui(stdscr):
-    # Initialize curses modes
+    # Initialize curses
     curses.curs_set(0)
     stdscr.keypad(True)
-    stdscr.nodelay(True)                 # make getch non-blocking
+    stdscr.nodelay(True)                 # non-blocking getch()
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     curses.start_color()
     curses.use_default_colors()
@@ -286,16 +286,18 @@ def _ui(stdscr):
     yes_link = curses.color_pair(3)
     warn_col = curses.color_pair(4)
 
-    # Load history and initial state
-    msgs    = _history()
-    viewofs = max(0, len(msgs) - (curses.LINES - PAD_V*2 - 2))
+    # Load history and start at bottom
+    msgs = _history()
+    h, w = stdscr.getmaxyx()
+    pane_h = h - PAD_V*2 - 2
+    viewofs = max(0, len(msgs) - pane_h)
+
     send_mode = False
     inp = ""
-
     TITLE = " Retro-Meshtastic Badge — Touch or ↑/↓ to scroll "
 
     while not stop_evt.is_set():
-        # 1) Drain incoming messages
+        # 1) Drain incoming queue
         try:
             while True:
                 msgs.append(incoming_q.get_nowait())
@@ -307,7 +309,7 @@ def _ui(stdscr):
         pane_h = h - PAD_V*2 - 2
         viewofs = max(0, len(msgs) - pane_h)
 
-        # 3) Draw UI
+        # 3) Draw the frame
         stdscr.erase()
         stdscr.addstr(0, 0, "╔" + TITLE.center(w-2, "═")[:w-2] + "╗", text_col)
 
@@ -328,19 +330,24 @@ def _ui(stdscr):
         row, used, idx = row_start, 0, viewofs
         while used < pane_h and idx < len(msgs):
             ts, src, txt = msgs[idx]
-            prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
+            # guard against None
+            safe_src = (src or "unknown")[:10]
+            prefix   = f"{_fmt(ts)} {safe_src:>10} │ "
             avail = w - len(prefix)
             for j, line in enumerate(textwrap.wrap(txt, width=avail) or [""]):
                 if used >= pane_h:
                     break
-                line_out = (prefix + line if j == 0 else " " * len(prefix) + line).ljust(w)[:w]
+                if j == 0:
+                    line_out = (prefix + line).ljust(w)[:w]
+                else:
+                    line_out = (" " * len(prefix) + line).ljust(w)[:w]
                 stdscr.addstr(row + used, 0, line_out, text_col)
                 used += 1
             idx += 1
 
         stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝", text_col)
 
-        # Send prompt or footer
+        # Footer or send prompt
         if send_mode:
             prompt = f"Send> {inp}"
             safe_footer(stdscr, h-1, prompt, text_col)
@@ -352,13 +359,13 @@ def _ui(stdscr):
         stdscr.refresh()
         curses.napms(100)
 
-        # 4) Handle keys
+        # 4) Handle input
         try:
             c = stdscr.getch()
         except curses.error:
             c = -1
 
-        # Immediate quit on Ctrl-C or Q
+        # Quit on Ctrl-C or Q
         if c in (3, ord('q'), ord('Q')):
             stop_evt.set()
             raise KeyboardInterrupt
@@ -370,7 +377,7 @@ def _ui(stdscr):
             send_mode, inp = True, ""
             continue
 
-        # In send mode: use Textbox for editing
+        # In send mode: use Textbox
         if send_mode:
             curses.curs_set(1)
             h, w = stdscr.getmaxyx()
@@ -384,7 +391,7 @@ def _ui(stdscr):
             tb = curses.textpad.Textbox(win, insert_mode=True)
 
             def validator(ch):
-                return 7 if ch in (10, 13) else ch  # Enter → BEL to finish
+                return 7 if ch in (10, 13) else ch
 
             try:
                 s = tb.edit(validator).strip()
@@ -400,7 +407,7 @@ def _ui(stdscr):
                 outgoing_q.put(s)
             continue
 
-        # Navigation keys
+        # Navigation
         if c == curses.KEY_UP:
             viewofs = max(0, viewofs - 1)
         elif c == curses.KEY_DOWN:
@@ -415,164 +422,6 @@ def _ui(stdscr):
                 viewofs = max(0, viewofs - 3)
             elif b & curses.BUTTON5_PRESSED:
                 viewofs = min(len(msgs) - pane_h, viewofs + 3)
-
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    stdscr.nodelay(True)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_RED,   curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_BLUE,  curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-
-    text_col = curses.color_pair(1)
-    no_link  = curses.color_pair(2)
-    yes_link = curses.color_pair(3)
-    warn_col = curses.color_pair(4)
-
-    msgs    = _history()
-    viewofs = max(0, len(msgs) - (curses.LINES - PAD_V*2 - 2))
-    send_mode = False
-    inp = ""
-
-    TITLE = " Retro-Meshtastic Badge — Touch or ↑/↓ to scroll "
-
-    while not stop_evt.is_set():
-        # drain incoming messages & always jump to bottom
-        try:
-            while True:
-                msgs.append(incoming_q.get_nowait())
-        except queue.Empty:
-            pass
-        # recompute scroll offset to show newest
-        h, w = stdscr.getmaxyx()
-        pane_h = h - PAD_V*2 - 2
-        viewofs = max(0, len(msgs) - pane_h)
-
-        stdscr.erase()
-        stdscr.addstr(0, 0, "╔" + TITLE.center(w-2, "═")[:w-2] + "╗", text_col)
-        
-        # Show detailed connection status
-        if link_up_evt.is_set():
-            safe_footer(stdscr, 1, "[● LINKED] Connected to " + NODE_ADDR, yes_link)
-            row_start = PAD_V + 2
-        else:
-            safe_footer(stdscr, 1, "[○ NO LINK] " + connection_status[:w-5], no_link)
-            # detailed debug line
-            if h > 10:
-                debug = f"Last attempt: {int(time.time()-last_connection_attempt)}s ago"
-                safe_footer(stdscr, 2, debug[:w-1], warn_col)
-                row_start = PAD_V + 3
-            else:
-                row_start = PAD_V + 2
-
-        # render wrapped history
-        row, used, idx = row_start, 0, viewofs
-        while used < pane_h and idx < len(msgs):
-            ts, src, txt = msgs[idx]
-            prefix = f"{_fmt(ts)} {src[:10]:>10} │ "
-            avail = w - len(prefix)
-            for j, line in enumerate(textwrap.wrap(txt, width=avail) or [""]):  # Fix unpacking issue
-                if used >= pane_h: break
-                if j == 0:
-                    line_out = (prefix + line).ljust(w)[:w]
-                else:
-                    line_out = (" " * len(prefix) + line).ljust(w)[:w]
-                stdscr.addstr(row + used, 0, line_out, text_col)
-                used += 1
-            idx += 1
-
-        stdscr.addstr(h-2, 0, "╚" + "═"*(w-2) + "╝", text_col)
-        if send_mode:
-            prompt = f"Send> {inp}"
-            safe_footer(stdscr, h-1, prompt, text_col)
-            stdscr.move(h-1, min(len(prompt), w-2))
-        else:
-            footer = "[S]end  [Ctrl-C/Q] quit  ↑/↓ PgUp/PgDn  Touch scroll"
-            safe_footer(stdscr, h-1, footer, text_col)
-
-        stdscr.refresh()
-        curses.napms(100)
-
-        try:
-            c = stdscr.getch()
-        except curses.error:
-            continue
-        if c == 3:
-            stop_evt.set()
-            raise KeyboardInterrupt
-        if stop_evt.is_set():
-            return  # Exit UI loop immediately if stop event is set
-
-        if send_mode:
-            # draw the prompt
-            h, w = stdscr.getmaxyx()
-            prompt = "Send> "
-            stdscr.addstr(h-1, 0, prompt, text_col)
-            stdscr.clrtoeol()
-            curses.curs_set(1)
-            stdscr.refresh()
-
-            # new 1-line window for text entry
-            win = curses.newwin(1, w - len(prompt) - 1, h-1, len(prompt))
-            win.keypad(True)
-            tb = curses.textpad.Textbox(win, insert_mode=True)
-
-            # make Enter finish editing
-            def validator(ch):
-                if ch in (10, 13):
-                    return 7    # Ctrl-G, the default "end edit" trigger
-                return ch
-
-            try:
-                s = tb.edit(validator).strip()
-            finally:
-                curses.curs_set(0)
-
-            send_mode = False
-            if s:
-                ts = time.time()
-                with db:
-                    db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", s))
-                msgs.append((ts, "You", s))
-                outgoing_q.put(s)
-            continue
-        try:
-            c = stdscr.getch()
-        except curses.error:
-            c = -1
-
-        if c == 3:                # Ctrl-C
-            stop_evt.set()
-            raise KeyboardInterrupt
-        if stop_evt.is_set():
-            return
-
-        if c == -1:
-            # no key this iteration—just keep going
-            continue
-        # navigation keys
-        if c == curses.KEY_UP:
-            viewofs = max(0, viewofs - 1)
-        elif c == curses.KEY_DOWN:
-            viewofs = min(len(msgs)-pane_h, viewofs + 1)
-        elif c == curses.KEY_PPAGE:
-            viewofs = max(0, viewofs - pane_h)
-        elif c == curses.KEY_NPAGE:
-            viewofs = min(len(msgs)-pane_h, viewofs + pane_h)
-        elif c == curses.KEY_MOUSE:
-            _, mx, my, _, b = curses.getmouse()
-            if b & curses.BUTTON4_PRESSED:
-                viewofs = max(0, viewofs - 3)
-            if b & curses.BUTTON5_PRESSED:
-                viewofs = min(len(msgs)-pane_h, viewofs + 3)
-        elif c in (ord('s'), ord('S')):
-            send_mode, inp = True, ""
-        elif c in (ord('q'), ord('Q')):
-            stop_evt.set()
-            raise KeyboardInterrupt  # Exit UI loop immediately on Q
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
