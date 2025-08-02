@@ -44,6 +44,20 @@ _iface      = None
 connection_status = "Initializing..."  # For UI display
 last_connection_attempt = 0
 
+db_q = queue.Queue()
+def db_writer():
+    while True:
+        ts, src, txt = db_q.get()
+        with db:
+            db.execute(
+                "INSERT INTO messages (ts, src, txt) VALUES (?,?,?)",
+                (ts, src, txt),
+            )
+        db_q.task_done()
+
+threading.Thread(target=db_writer, daemon=True).start()
+
+
 # ── SIMPLE MESSAGE HANDLER ──────────────────────────────────────────────────
 def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
     # writeflush helper
@@ -53,60 +67,58 @@ def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
 
     log(f"# PACKET: topic={topic} packet={packet}")
     try:
+        # --- extract text, src, ts exactly as before ---
         txt_field = None
-
-        # 1. packets delivered as dicts
         if isinstance(packet, dict):
             dec = packet.get("decoded", {})
-            # easiest cases first
             txt_field = dec.get("text") or dec.get("data", {}).get("text")
-
-            # new‑style: data.payload -> bytes list
             if txt_field is None and dec.get("data", {}).get("payload"):
                 try:
                     pl = dec["data"]["payload"]
-                    txt_field = (bytes(pl) if isinstance(pl, list) else pl).decode("utf‑8", "ignore")
+                    txt_field = (bytes(pl) if isinstance(pl, list) else pl).decode("utf-8", "ignore")
                 except Exception:
                     pass
-
             src = packet.get("fromId", "unknown")
             ts  = packet.get("rxTime", time.time())
-
-        else:                                      # packet as object
+        else:
             dec = getattr(packet, "decoded", None)
             if dec:
                 txt_field = getattr(dec, "text", None)
-
                 data = getattr(dec, "data", None)
                 if txt_field is None and data:
                     txt_field = getattr(data, "text", None)
                     if txt_field is None and hasattr(data, "payload"):
                         try:
-                            txt_field = bytes(data.payload).decode("utf‑8", "ignore")
+                            txt_field = bytes(data.payload).decode("utf-8", "ignore")
                         except Exception:
                             pass
-
             src = getattr(packet, "fromId", "unknown")
             ts  = getattr(packet, "rxTime", time.time())
-        # ---------- end extraction ----------
 
+        # --- bail if no text ---
         if not txt_field:
-            return   # not a text packet we care about
+            return
 
-        if ts > 1e12:          # ms → s
+        # ms→s sanity
+        if ts > 1e12:
             ts /= 1000
         text = txt_field[:MAX_LEN]
 
         log(f"# Received: {src}: {text}")
-        with db:
-            db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, src, text))
+
+        # 1) enqueue to UI (non-blocking)
         try:
             incoming_q.put_nowait((ts, src, text))
         except queue.Full:
-            # drop it
+            # UI is backed up, drop
             pass
+
+        # 2) enqueue to DB writer (blocking if it ever needs to)
+        db_q.put((ts, src, text))
+
     except Exception as e:
         log(f"# Message handler error: {e}")
+
 
 def on_conn_established(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     link_up_evt.set()
@@ -117,8 +129,7 @@ def on_conn_lost(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
     json_fh.write("# CONNECTION LOST\n")
 
 # ── PUBSUB SUBSCRIPTIONS ─────────────────────────────────────────────────────
-pub.subscribe(simple_message_handler,        "meshtastic.receive.text")       
-pub.subscribe(simple_message_handler,        "meshtastic.receive.data")       
+pub.subscribe(simple_message_handler,        "meshtastic.receive")       
 pub.subscribe(on_conn_established,           "meshtastic.connection.established")
 pub.subscribe(on_conn_lost,                  "meshtastic.connection.lost")
 
@@ -396,8 +407,9 @@ def _ui(stdscr):
             send_mode = False
             if s:
                 ts = time.time()
-                with db: db.execute("INSERT INTO messages VALUES (?,?,?)", (ts, "You", s))
-                msgs.append((ts, "You", s)); outgoing_q.put(s)
+                db_q.put((ts, "You", s))           # hand off to the writer thread
+                msgs.append((ts, "You", s))
+                outgoing_q.put(s)
             continue
 
         # Navigation keys
