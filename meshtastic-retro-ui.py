@@ -39,9 +39,8 @@ incoming_q  = queue.Queue(1024)
 outgoing_q  = queue.Queue(256)
 link_up_evt = threading.Event()
 stop_evt    = threading.Event()
-_iface_lock = threading.Lock()
 _iface      = None
-connection_status = "Initializing..."  # For UI display
+connection_status = "Initializing..."
 last_connection_attempt = 0
 
 db_q = queue.Queue()
@@ -161,88 +160,58 @@ def _radio_worker():
     json_fh.write(f"# Using BLE address: '{addr}'\n")
     json_fh.flush()
     
-    retry_count = 0
-    max_retries = 3
-    
-    while not stop_evt.is_set() and retry_count < max_retries:
-        try:
-            last_connection_attempt = time.time()
-            connection_status = f"Connecting to {addr}... (attempt {retry_count + 1})"
-            json_fh.write(f"# Connection attempt {retry_count + 1} to {addr}\n")
-            json_fh.flush()
-            
-            # Simple interface creation - like your old working code
-            json_fh.write(f"# Creating BLE interface for {addr}...\n")
-            json_fh.flush()
-            _iface = BLEInterface(address=addr, debugOut=json_fh)
-            
-            json_fh.write("# Interface created! Waiting for pubsub events...\n")
-            json_fh.flush()
-            connection_status = "Interface created, waiting for connection..."
-            
-            # Reset retry count on successful interface creation
-            retry_count = 0
-            
-            # Simple message handling loop - let pubsub handle connection events
-            while not stop_evt.is_set():
-                try:
-                    # Handle outgoing messages
-                    msg = outgoing_q.get(timeout=1.0)
-                    json_fh.write(f"# Sending: {msg}\n")
-                    json_fh.flush()
-                    connection_status = f"Sending: {msg[:20]}..."
-                    
-                    # Simple send - no locks, no complex error handling
-                    _iface.sendText(msg)
-                    json_fh.write(f"# Message sent successfully\n")
-                    json_fh.flush()
-                    connection_status = "Message sent!"
-                    
-                except queue.Empty:
-                    # No outgoing messages, just keep running
-                    if not connection_status.endswith("(idle)"):
-                        connection_status = "Waiting for messages (idle)"
-                    continue
-                    
-                except Exception as e:
-                    json_fh.write(f"# Send error: {e}\n")
-                    json_fh.flush()
-                    connection_status = f"Send error: {e}"
-                    # Don't break immediately - might be temporary
-                    time.sleep(1)
-                    
-        except Exception as e:
-            json_fh.write(f"# Interface creation error: {e}\n")
-            import traceback
-            json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
-            json_fh.flush()
-            retry_count += 1
-            connection_status = f"Interface error: {str(e)[:40]}..."
-            
-        finally:
-            # Simple cleanup
-            if _iface:
-                try:
-                    _iface.close()
-                    json_fh.write("# Interface closed\n")
-                    json_fh.flush()
-                except Exception as e:
-                    json_fh.write(f"# Close error: {e}\n")
-                    json_fh.flush()
-                _iface = None
-            
-            # Wait before retry
-            if not stop_evt.is_set() and retry_count < max_retries:
-                wait_time = 5  # Fixed 5 second wait
-                json_fh.write(f"# Retrying in {wait_time}s...\n")
-                json_fh.flush()
-                connection_status = f"Retrying in {wait_time}s..."
-                stop_evt.wait(wait_time)
-    
-    if retry_count >= max_retries:
-        json_fh.write(f"# Max retries exceeded for {addr}\n")
+    # Single connection attempt - just like your old working code
+    try:
+        last_connection_attempt = time.time()
+        connection_status = f"Connecting to {addr}..."
+        json_fh.write(f"# Creating BLE interface for {addr}...\n")
         json_fh.flush()
-        connection_status = f"Max retries exceeded for {addr}"
+        
+        # Create interface and let it handle everything - like old code
+        _iface = BLEInterface(address=addr, debugOut=json_fh)
+        
+        json_fh.write("# Interface created! Letting it manage connection automatically...\n")
+        json_fh.flush()
+        connection_status = "Interface created - auto-managing connection"
+        
+        # Ultra-simple message loop - just handle sends
+        while not stop_evt.is_set():
+            try:
+                # Only handle outgoing messages - let interface handle everything else
+                msg = outgoing_q.get(timeout=2.0)
+                json_fh.write(f"# Sending: {msg}\n")
+                json_fh.flush()
+                
+                _iface.sendText(msg)
+                json_fh.write(f"# Sent successfully\n")
+                json_fh.flush()
+                
+            except queue.Empty:
+                # No messages to send, just continue
+                continue
+            except Exception as e:
+                json_fh.write(f"# Send error: {e}\n")
+                json_fh.flush()
+                time.sleep(1)  # Brief pause on error
+                
+    except Exception as e:
+        json_fh.write(f"# Interface creation failed: {e}\n")
+        import traceback
+        json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
+        json_fh.flush()
+        connection_status = f"Interface creation failed: {str(e)[:40]}..."
+        
+    finally:
+        # Clean shutdown
+        if _iface:
+            try:
+                _iface.close()
+                json_fh.write("# Interface closed\n")
+                json_fh.flush()
+            except Exception as e:
+                json_fh.write(f"# Close error: {e}\n")
+                json_fh.flush()
+            _iface = None
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
