@@ -39,8 +39,9 @@ incoming_q  = queue.Queue(1024)
 outgoing_q  = queue.Queue(256)
 link_up_evt = threading.Event()
 stop_evt    = threading.Event()
+_iface_lock = threading.Lock()
 _iface      = None
-connection_status = "Initializing..."
+connection_status = "Initializing..."  # For UI display
 last_connection_attempt = 0
 
 db_q = queue.Queue()
@@ -120,18 +121,12 @@ def simple_message_handler(packet, interface=None, topic=pub.AUTO_TOPIC):
 
 
 def on_conn_established(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
-    global connection_status
     link_up_evt.set()
-    connection_status = "Connected via pubsub event!"
-    json_fh.write("# CONNECTION ESTABLISHED VIA PUBSUB\n")
-    json_fh.flush()
+    json_fh.write("# CONNECTION ESTABLISHED\n")
 
 def on_conn_lost(interface=None, topic=pub.AUTO_TOPIC, **kwargs):
-    global connection_status
     link_up_evt.clear()
-    connection_status = "Connection lost via pubsub event"
-    json_fh.write("# CONNECTION LOST VIA PUBSUB\n")
-    json_fh.flush()
+    json_fh.write("# CONNECTION LOST\n")
 
 # ── PUBSUB SUBSCRIPTIONS ─────────────────────────────────────────────────────
 pub.subscribe(simple_message_handler,        "meshtastic.receive")       
@@ -146,72 +141,128 @@ def _radio_worker():
     # Use the explicit address provided
     addr = NODE_ADDR
     json_fh.write(f"# NODE_ADDR from env: '{addr}'\n")
-    json_fh.flush()
     
     # Check if we have a valid address
-    if not addr or addr == "NOT_CONFIGURED":
+    if not addr:
         json_fh.write(f"# Invalid BLE address: '{addr}'\n")
         json_fh.write("# Please set MESHTASTIC_BLE_ADDR to your device's MAC address in run_badge.sh\n")
-        json_fh.flush()
         connection_status = "No valid BLE address - check run_badge.sh"
         return
     
-    addr = addr.strip()
+    addr = addr.strip()  # Remove any whitespace
     json_fh.write(f"# Using BLE address: '{addr}'\n")
-    json_fh.flush()
     
-    # Single connection attempt - just like your old working code
-    try:
-        last_connection_attempt = time.time()
-        connection_status = f"Connecting to {addr}..."
-        json_fh.write(f"# Creating BLE interface for {addr}...\n")
-        json_fh.flush()
-        
-        # Create interface and let it handle everything - like old code
-        _iface = BLEInterface(address=addr, debugOut=json_fh)
-        
-        json_fh.write("# Interface created! Letting it manage connection automatically...\n")
-        json_fh.flush()
-        connection_status = "Interface created - auto-managing connection"
-        
-        # Ultra-simple message loop - just handle sends
-        while not stop_evt.is_set():
-            try:
-                # Only handle outgoing messages - let interface handle everything else
-                msg = outgoing_q.get(timeout=2.0)
-                json_fh.write(f"# Sending: {msg}\n")
-                json_fh.flush()
+    # Skip the verification scan - go straight to connection attempt
+    connection_status = f"Ready to connect to {addr}"
+    
+    retry_count = 0
+    max_retries = 5
+    
+    while not stop_evt.is_set() and retry_count < max_retries:
+        try:
+            last_connection_attempt = time.time()
+            connection_status = f"Connecting to {addr}... ({retry_count + 1}/{max_retries})"
+            json_fh.write(f"# Connection attempt {retry_count + 1} to {addr}\n")
+            
+            # Clear previous state
+            link_up_evt.clear()
+            
+            # Create interface with the explicit address
+            json_fh.write(f"# Creating BLE interface for {addr}...\n")
+            with _iface_lock:
+                _iface = BLEInterface(address=addr, debugOut=json_fh)
+            
+            json_fh.write("# Interface created, testing connection...\n")
+            connection_status = "Testing connection..."
+            
+            # Test connection by getting node info
+            max_test_attempts = 10
+            
+            for i in range(max_test_attempts):
+                try:
+                    with _iface_lock:
+                        if _iface:
+                            my_info = _iface.getMyNodeInfo()
+                            if my_info:
+                                node_name = my_info.get('user', {}).get('longName', 'Unknown')
+                                json_fh.write(f"# Connected to: {node_name}\n")
+                                connection_status = f"Connected to {node_name}!"
+                                link_up_evt.set()
+                                break
+                except Exception as e:
+                    json_fh.write(f"# Connection test {i+1} failed: {e}\n")
                 
-                _iface.sendText(msg)
-                json_fh.write(f"# Sent successfully\n")
-                json_fh.flush()
+                connection_status = f"Testing connection... ({i+1}/{max_test_attempts})"
+                time.sleep(2)
                 
-            except queue.Empty:
-                # No messages to send, just continue
-                continue
-            except Exception as e:
-                json_fh.write(f"# Send error: {e}\n")
-                json_fh.flush()
-                time.sleep(1)  # Brief pause on error
+                if stop_evt.is_set():
+                    break
+            
+            if link_up_evt.is_set():
+                json_fh.write("# Connection established, entering message loop\n")
+                retry_count = 0  # Reset on success
                 
-    except Exception as e:
-        json_fh.write(f"# Interface creation failed: {e}\n")
-        import traceback
-        json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
-        json_fh.flush()
-        connection_status = f"Interface creation failed: {str(e)[:40]}..."
-        
-    finally:
-        # Clean shutdown
-        if _iface:
-            try:
-                _iface.close()
-                json_fh.write("# Interface closed\n")
-                json_fh.flush()
-            except Exception as e:
-                json_fh.write(f"# Close error: {e}\n")
-                json_fh.flush()
-            _iface = None
+                # Main message loop
+                while not stop_evt.is_set() and link_up_evt.is_set():
+                    try:
+                        # Handle outgoing messages
+                        msg = outgoing_q.get(timeout=2.0)
+                        json_fh.write(f"# Sending: {msg}\n")
+                        connection_status = f"Sending: {msg[:20]}..."
+                        
+                        with _iface_lock:
+                            if _iface:
+                                # Use wantAck=True for reliable delivery
+                                try:
+                                    sent_packet = _iface.sendText(msg, wantAck=True)
+                                    json_fh.write(f"# sendText returned: {sent_packet}\n")
+                                    connection_status = "Message sent!"
+                                except Exception as send_err:
+                                    json_fh.write(f"# sendText error: {send_err}\n")
+                                    connection_status = f"Send error: {send_err}"
+                                    break
+                                
+                    except queue.Empty:
+                        # No outgoing messages, just keep connection alive
+                        connection_status = "Connected (idle)"
+                        continue
+                    except Exception as e:
+                        json_fh.write(f"# Send error: {e}\n")
+                        connection_status = f"Send error: {e}"
+                        break
+            else:
+                json_fh.write("# Connection test failed\n")
+                connection_status = "Connection test failed"
+                retry_count += 1
+                
+        except Exception as e:
+            json_fh.write(f"# Radio worker error: {e}\n")
+            import traceback
+            json_fh.write(f"# Traceback: {traceback.format_exc()}\n")
+            retry_count += 1
+            connection_status = f"Error: {str(e)[:50]}..."
+            
+        finally:
+            # Cleanup
+            link_up_evt.clear()
+            with _iface_lock:
+                if _iface:
+                    try:
+                        _iface.close()
+                        json_fh.write("# Interface closed\n")
+                    except Exception as e:
+                        json_fh.write(f"# Close error: {e}\n")
+                    _iface = None
+            
+            if not stop_evt.is_set() and retry_count < max_retries:
+                wait_time = 10 + retry_count * 5
+                json_fh.write(f"# Retrying in {wait_time}s...\n")
+                connection_status = f"Retrying in {wait_time}s..."
+                stop_evt.wait(wait_time)
+    
+    if retry_count >= max_retries:
+        json_fh.write(f"# Max retries exceeded for {addr}\n")
+        connection_status = f"Max retries exceeded for {addr}"
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
