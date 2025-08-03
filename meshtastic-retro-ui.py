@@ -346,21 +346,43 @@ def _sender():
         except Exception as e:
             json_fh.write(f"# sendText error: {e}\n")
 threading.Thread(target=_sender, daemon=True).start()
-
 def main():
+    global _iface  # <— ensure we write to the module variable
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
-    threading.Thread(target=_radio_worker, daemon=True).start()
+
+    # 1) Connect once (or scan if you like)
+    try:
+        _iface = BLEInterface(address=NODE_ADDR, debugOut=json_fh)
+    except Exception as e:
+        print(f"❌ Unable to connect to {NODE_ADDR}: {e}")
+        return
+
+    # 2) Let the library run its own loop forever
+    threading.Thread(target=_iface.loop_forever, daemon=True).start()
+
+    # 3) Sender thread (now that _iface is set)
+    def _sender():
+        while not stop_evt.is_set():
+            msg = outgoing_q.get()
+            try:
+                _iface.sendText(msg, wantAck=True)
+            except Exception as send_err:
+                json_fh.write(f"# sendText error: {send_err}\n")
+    threading.Thread(target=_sender, daemon=True).start()
+
+    # 4) Run the UI
     try:
         curses.wrapper(_ui)
     except KeyboardInterrupt:
         pass
-    except Exception:
-        # swallow other UI errors so your BLE thread can keep running
-        pass
-    stop_evt.set()
-    json_fh.close()
-    db.close()
+    finally:
+        stop_evt.set()
+        try: _iface.close()
+        except: pass
+        json_fh.close()
+        db.close()
+
 
 
 if __name__ == "__main__":
