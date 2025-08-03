@@ -135,74 +135,47 @@ pub.subscribe(on_conn_lost,                  "meshtastic.connection.lost")
 
 # ── RADIO THREAD ──────────────────────────────────────────────────────────────
 
-# ── RADIO THREAD (simplified) ────────────────────────────────────────────────
 def _radio_worker():
-    """
-    One very small loop:
-        1. Try to create a BLEInterface (blocks until the library finishes
-           its own BLE / protobuf handshake).
-        2. While connected, pull messages from outgoing_q and send them.
-        3. If *any* exception bubbles up, close the interface, clear the
-           link‑up flag, sleep a moment, and go back to (1).
-
-    Meshtastic’s BLEInterface already:
-      • discovers service/characteristics
-      • negotiates the protobuf link
-      • fires pub‑sub events on (re)connect / loss
-    so we no longer re‑implement that logic here.
-    """
     global _iface, connection_status
-
     addr = NODE_ADDR.strip()
     if not addr:
-        connection_status = "No BLE address configured"
-        return
+        connection_status = "No BLE address configured"; return
 
-    backoff_s = 5           # seconds between attempts
+    backoff = 5                  # seconds between retries
+
     while not stop_evt.is_set():
         try:
+            # 1. Connect (library handles handshake + PubSub events) ------------
             connection_status = f"Connecting to {addr}…"
-            json_fh.write(f"# Trying BLEInterface({addr})\n")
 
-            # 1. Create the interface; this blocks until the protocol hand‑
-            #    shake completes or raises BLEError on failure.
-            with _iface_lock:
-                _iface = BLEInterface(address=addr, debugOut=json_fh)
+            _iface = BLEInterface(
+                address      = addr,
+                debugOut     = json_fh,
+                pairing_pin  = os.getenv("MESHTASTIC_PIN", "123456")  # optional
+            )
 
-            # The library will now raise “meshtastic.connection.established”;
-            # on_conn_established() flips link_up_evt, so the UI turns blue.
-            connection_status = f"Connected to {addr}"
+            connection_status = "Connected"
+            # 2. Keep‑alive -----------------------------------------------------
+            ka = threading.Thread(target=_keepalive, daemon=True); ka.start()
 
-            # 2. Main send loop – *nothing else* is required; incoming
-            #    packets are handled by the PubSub callback you already
-            #    registered (simple_message_handler).
+            # 3. Pump outgoing messages ----------------------------------------
             while not stop_evt.is_set():
                 try:
-                    msg = outgoing_q.get(timeout=1.0)
+                    msg = outgoing_q.get(timeout=1)
+                    _iface.sendText(msg, wantAck=True)
                 except queue.Empty:
-                    continue          # no outgoing traffic – stay idle
-
-                # wantAck=True lets the library wait for the normal ACK/NAK
-                _iface.sendText(msg, wantAck=True)
-                json_fh.write(f"# Sent: {msg}\n")
+                    pass
 
         except Exception as e:
-            # Any error – lost link, BLE exception, etc.
-            json_fh.write(f"# Radio thread error: {e}\n")
             connection_status = f"Disconnected: {e}"
         finally:
-            # 3. Clean‑up and prepare to retry.
             link_up_evt.clear()
-            with _iface_lock:
-                if _iface:
-                    try:
-                        _iface.close()
-                    except Exception:
-                        pass
-                    _iface = None
-
+            if _iface:
+                try: _iface.close()
+                except Exception: pass
+                _iface = None
             if not stop_evt.is_set():
-                time.sleep(backoff_s)
+                time.sleep(backoff)
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def _fmt(ts: float) -> str:
