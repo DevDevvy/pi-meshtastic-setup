@@ -368,6 +368,18 @@ def main():
             except Exception as send_err:
                 json_fh.write(f"# sendText error: {send_err}\n")
     threading.Thread(target=_sender, daemon=True).start()
+    
+    # 3.5) Make sure any messages we've already received are fully
+    #       written to the DB, then clear the incoming queue so
+    #       that our UI initial _history() shows them all (and we
+    #       don’t re-drain them as “new” messages).
+    db_q.join()  # wait for the db_writer thread to finish all pending writes
+    # clear any already-queued items in incoming_q
+    try:
+        while True:
+            incoming_q.get_nowait()
+    except queue.Empty:
+        pass
 
     # 3) Run the UI (blocks here, keeping the process—and BLE thread—alive)
     try:
