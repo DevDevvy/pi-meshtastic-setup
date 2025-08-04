@@ -141,7 +141,7 @@ def _radio_worker():
     """
     1. Get an address (env‑var or auto‑scan)
     2. Call BLEInterface(address).loop_forever()    ← library keeps it alive
-    3. If it ever throws, wait 5 s and start again
+    3. If it ever throws, wait 5 s and start again
     """
     global _iface, connection_status
 
@@ -165,13 +165,19 @@ def _radio_worker():
                     continue
 
             connection_status = f"Connecting to {addr}"
-            _iface = BLEInterface(address=addr, debugOut=json_fh)
+            with _iface_lock:
+                _iface = BLEInterface(address=addr, debugOut=json_fh)
+                # Request message history on connection
+                _iface.localNode.requestConfig()
+                time.sleep(2)  # Give it time to sync
             connection_status = "Connected"
             _iface.loop_forever()            # ‑ never returns unless the link dies
 
         except Exception as e:
             connection_status = f"Disconnected: {e}"
             link_up_evt.clear()
+            with _iface_lock:
+                _iface = None
             time.sleep(backoff)
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -338,41 +344,35 @@ def _ui(stdscr):
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 def _sig(*_):
     stop_evt.set()
+
 def _sender():
     while not stop_evt.is_set():
         msg = outgoing_q.get()
         try:
-            if _iface: _iface.sendText(msg, wantAck=True)
+            with _iface_lock:
+                if _iface: 
+                    _iface.sendText(msg, wantAck=True)
         except Exception as e:
             json_fh.write(f"# sendText error: {e}\n")
-threading.Thread(target=_sender, daemon=True).start()
 
 def main():
     global _iface
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    # 1) Connect once (or exit)
-    try:
-        _iface = BLEInterface(address=NODE_ADDR, debugOut=json_fh)
-    except Exception as e:
-        print(f"❌ Unable to connect to {NODE_ADDR}: {e}")
-        return
-
-    # 2) Sender thread: pull from outgoing_q → sendText()
-    def _sender():
-        while not stop_evt.is_set():
-            msg = outgoing_q.get()
-            try:
-                _iface.sendText(msg, wantAck=True)
-            except Exception as send_err:
-                json_fh.write(f"# sendText error: {send_err}\n")
+    # Start the radio worker thread to handle connection and message history
+    threading.Thread(target=_radio_worker, daemon=True).start()
+    
+    # Start sender thread
     threading.Thread(target=_sender, daemon=True).start()
     
-    # 3.5) Make sure any messages we've already received are fully
-    #       written to the DB, then clear the incoming queue so
-    #       that our UI initial _history() shows them all (and we
-    #       don’t re-drain them as “new” messages).
+    # Wait a bit for initial connection and message sync
+    time.sleep(3)
+    
+    # Make sure any messages we've already received are fully
+    # written to the DB, then clear the incoming queue so
+    # that our UI initial _history() shows them all (and we
+    # don't re-drain them as "new" messages).
     db_q.join()  # wait for the db_writer thread to finish all pending writes
     # clear any already-queued items in incoming_q
     try:
@@ -381,15 +381,19 @@ def main():
     except queue.Empty:
         pass
 
-    # 3) Run the UI (blocks here, keeping the process—and BLE thread—alive)
+    # Run the UI (blocks here, keeping the process—and BLE thread—alive)
     try:
         curses.wrapper(_ui)
     except KeyboardInterrupt:
         pass
     finally:
         stop_evt.set()
-        try:   _iface.close()
-        except: pass
+        try:   
+            with _iface_lock:
+                if _iface:
+                    _iface.close()
+        except: 
+            pass
         json_fh.close()
         db.close()
 
