@@ -165,19 +165,19 @@ def _radio_worker():
                     continue
 
             connection_status = f"Connecting to {addr}"
-            with _iface_lock:
-                _iface = BLEInterface(address=addr, debugOut=json_fh)
-                # Request message history on connection
+            _iface = BLEInterface(address=addr, debugOut=json_fh)
+            # Request message history on connection
+            try:
                 _iface.localNode.requestConfig()
-                time.sleep(2)  # Give it time to sync
+                time.sleep(2)  # Give it time to sync messages
+            except Exception as e:
+                json_fh.write(f"# Error requesting config: {e}\n")
             connection_status = "Connected"
             _iface.loop_forever()            # ‑ never returns unless the link dies
 
         except Exception as e:
             connection_status = f"Disconnected: {e}"
             link_up_evt.clear()
-            with _iface_lock:
-                _iface = None
             time.sleep(backoff)
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -349,9 +349,7 @@ def _sender():
     while not stop_evt.is_set():
         msg = outgoing_q.get()
         try:
-            with _iface_lock:
-                if _iface: 
-                    _iface.sendText(msg, wantAck=True)
+            if _iface: _iface.sendText(msg, wantAck=True)
         except Exception as e:
             json_fh.write(f"# sendText error: {e}\n")
 
@@ -389,9 +387,8 @@ def main():
     finally:
         stop_evt.set()
         try:   
-            with _iface_lock:
-                if _iface:
-                    _iface.close()
+            if _iface:
+                _iface.close()
         except: 
             pass
         json_fh.close()
