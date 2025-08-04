@@ -358,19 +358,27 @@ def main():
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    # Start the radio worker thread to handle connection and message history
-    threading.Thread(target=_radio_worker, daemon=True).start()
-    
-    # Start sender thread
+    # 1) Connect once (or exit)
+    try:
+        _iface = BLEInterface(address=NODE_ADDR, debugOut=json_fh)
+    except Exception as e:
+        print(f"❌ Unable to connect to {NODE_ADDR}: {e}")
+        return
+
+    # 2) Sender thread: pull from outgoing_q → sendText()
+    def _sender():
+        while not stop_evt.is_set():
+            msg = outgoing_q.get()
+            try:
+                _iface.sendText(msg, wantAck=True)
+            except Exception as send_err:
+                json_fh.write(f"# sendText error: {send_err}\n")
     threading.Thread(target=_sender, daemon=True).start()
     
-    # Wait a bit for initial connection and message sync
-    time.sleep(3)
-    
-    # Make sure any messages we've already received are fully
-    # written to the DB, then clear the incoming queue so
-    # that our UI initial _history() shows them all (and we
-    # don't re-drain them as "new" messages).
+    # 3.5) Make sure any messages we've already received are fully
+    #       written to the DB, then clear the incoming queue so
+    #       that our UI initial _history() shows them all (and we
+    #       don’t re-drain them as “new” messages).
     db_q.join()  # wait for the db_writer thread to finish all pending writes
     # clear any already-queued items in incoming_q
     try:
@@ -379,18 +387,15 @@ def main():
     except queue.Empty:
         pass
 
-    # Run the UI (blocks here, keeping the process—and BLE thread—alive)
+    # 3) Run the UI (blocks here, keeping the process—and BLE thread—alive)
     try:
         curses.wrapper(_ui)
     except KeyboardInterrupt:
         pass
     finally:
         stop_evt.set()
-        try:   
-            if _iface:
-                _iface.close()
-        except: 
-            pass
+        try:   _iface.close()
+        except: pass
         json_fh.close()
         db.close()
 
