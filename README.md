@@ -67,7 +67,7 @@ sudo bluetoothctl
 quit
 ```
 
-## Running the UI
+## Running UI
 
 ```
 ./run_badge.sh
